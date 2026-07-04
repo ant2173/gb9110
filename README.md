@@ -2,11 +2,11 @@
 
 **An experimental AI-assisted Nintendo Game Boy emulator frontend for the Nokia 9110 Communicator and PC/GEOS.**
 
-![GB ROM on real Nokia 9110 Communicator](\docs\images\nokia-9110-running-gb.JPG)
+![GB rom running on real nokia 9110](docs/images/nokia-9110-running-gb.JPG)
 
 GB9110 is a work-in-progress port of the [Peanut-GB](https://github.com/deltabeard/Peanut-GB) emulator core to a late-1990s Nokia/GEOS development environment using Borland C++ 4.52.
 
-![Debug information on Nokia 9110 screen](docs/images/rom-running-9110.JPG)
+![ROM information on Nokia Screen](docs/images/rom-running-9110.JPG)
 
 The project is already past the “hello world” stage:
 

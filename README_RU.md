@@ -2,7 +2,7 @@
 
 **Экспериментальный эмулятор Nintendo Game Boy для Nokia 9110 Communicator и PC/GEOS, написанный с помощью ИИ.**
 
-![Игра от GB запущена на реальном nokia 9110](\docs\images\nokia-9110-running-gb.JPG)
+![Игра от GB запущена на реальном nokia 9110](docs/images/nokia-9110-running-gb.JPG)
 
 GB9110 — незавершённый порт ядра [Peanut-GB](https://github.com/deltabeard/Peanut-GB) в среду Nokia 9110 SDK и Borland C++ 4.52.
 
