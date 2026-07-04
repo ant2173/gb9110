@@ -1,6 +1,6 @@
 # GB9110
 
-**Экспериментальный эмулятор Nintendo Game Boy для Nokia 9110 Communicator и PC/GEOS, написанный с помощью ИИ.**
+**Экспериментальный эмулятор Game Boy для Nokia 9110 Communicator и PC/GEOS, написанный с помощью ИИ.**
 
 ![Игра от GB запущена на реальном nokia 9110](docs/images/nokia-9110-running-gb.JPG)
 

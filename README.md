@@ -1,6 +1,6 @@
 # GB9110
 
-**An experimental AI-assisted Nintendo Game Boy emulator frontend for the Nokia 9110 Communicator and PC/GEOS.**
+**An experimental AI-assisted Game Boy emulator frontend for the Nokia 9110 Communicator and PC/GEOS.**
 
 ![GB rom running on real nokia 9110](docs/images/nokia-9110-running-gb.JPG)
 
