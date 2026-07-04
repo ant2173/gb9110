@@ -1,0 +1,1214 @@
+/***********************************************************************
+ *
+ * GBPROF v0.3 -- Nokia 9110 performance profiler
+ *
+ * Modes:
+ *   1 CORE       CPU/LCD timing only; Peanut line renderer disabled
+ *   2 RENDER     Peanut line renderer + 4-bpp packing; no screen blit
+ *   3 FULL 4BPP  renderer + packing + GrDrawImage
+ *   4 BLIT 4BPP  repeated static 4-bpp GrDrawImage; no emulation
+ *   5 BLIT MONO  repeated static 1-bpp GrDrawImage; no emulation
+ *
+ * This build deliberately uses a self-queued work message instead of a
+ * continual timer. Thus it measures maximum sustainable throughput without
+ * accumulating timer events faster than the real device can process them.
+ *
+ ***********************************************************************/
+
+@include <stdapp.goh>
+#include <graphics.h>
+#include <geode.h>
+#include <file.h>
+#include <timer.h>
+#include <input.h>
+
+#define ENABLE_SOUND 0
+#define ENABLE_LCD 1
+#define PEANUT_GB_12_COLOUR 0
+#define PEANUT_GB_HIGH_LCD_ACCURACY 0
+#define PEANUT_GB_USE_INTRINSICS 0
+#define PEANUT_GB_IS_LITTLE_ENDIAN 1
+
+#define GB_WIDTH                    160
+#define GB_HEIGHT                   144
+#define GB_4BPP_BYTES_PER_LINE       80
+#define GB_4BPP_FRAME_BYTES       11520
+#define GB_MONO_BYTES_PER_LINE       20
+#define GB_MONO_FRAME_BYTES        2880
+#define GB_MAX_STEPS_PER_FRAME    30000
+
+#define MODE_CORE                     1
+#define MODE_RENDER                   2
+#define MODE_FULL_4BPP                3
+#define MODE_BLIT_4BPP                4
+#define MODE_BLIT_MONO                5
+
+#define STAGE_UI_READY                0
+#define STAGE_ALLOC_4BPP              1
+#define STAGE_ALLOC_MONO              2
+#define STAGE_ALLOC_BANK0             3
+#define STAGE_ALLOC_BANK1             4
+#define STAGE_OPEN_FILE               5
+#define STAGE_READ_BANK0              6
+#define STAGE_READ_BANK1              7
+#define STAGE_VALIDATE_ROM            8
+#define STAGE_CALL_INIT               9
+#define STAGE_FIRST_FRAME            10
+#define STAGE_RUNNING                11
+#define STAGE_FAILED                100
+
+/*
+ * These variables must be declared before PGBLCD.H because the fast direct
+ * macros below are expanded inside the core.
+ */
+static byte *gbFastBank0 = NULL;
+static byte *gbFastBank1 = NULL;
+static Boolean gbRenderEnabled = TRUE;
+
+struct gb_s;
+
+static void GBCoreErrorDirect(struct gb_s *gb,
+                              const int error,
+                              const unsigned short address);
+static void GBLcdLine(struct gb_s *gb,
+                      const unsigned char *pixels,
+                      const unsigned char line);
+
+/*
+ * Fast 32 KiB direct ROM access. FlappyBird.gb has two 16 KiB banks.
+ * This removes a C function call from every ROM fetch/read.
+ */
+#define PGB_ROM_READ(gb, addr)                                      \
+    (((unsigned long)(addr) < 0x4000UL)                             \
+        ? gbFastBank0[(word)(addr)]                                 \
+        : gbFastBank1[(word)((unsigned long)(addr) & 0x3FFFUL)])
+
+#define PGB_CART_RAM_READ(gb, addr) (0xFF)
+#define PGB_CART_RAM_WRITE(gb, addr, val) ((void)0)
+
+#define PGB_REPORT_ERROR(gb, error, addr)                            \
+    GBCoreErrorDirect((gb), (int)(error), (unsigned short)(addr))
+
+/*
+ * When MODE_CORE is active this becomes FALSE, so Peanut-GB returns from
+ * __gb_draw_line before tile/sprite rendering begins.
+ */
+#define PGB_LCD_AVAILABLE(gb) (gbRenderEnabled)
+
+#define PGB_LCD_DRAW_LINE(gb, pixels, line)                          \
+    GBLcdLine((gb), (pixels), (unsigned char)(line))
+
+#include "PGBLCD.H"
+
+
+@class GBProfProcessClass, GenProcessClass;
+    @message void MSG_GBPROF_NEXT_STAGE();
+    @message void MSG_GBPROF_WORK();
+    @message void MSG_GBPROF_RESET();
+@endc;
+
+@classdecl GBProfProcessClass, neverSaved;
+
+
+typedef struct {
+    Bitmap header;
+    byte pixels[GB_4BPP_FRAME_BYTES];
+} GB4FrameBuffer;
+
+typedef struct {
+    Bitmap header;
+    byte pixels[GB_MONO_FRAME_BYTES];
+} GBMonoFrameBuffer;
+
+
+/***********************************************************************
+ * Runtime state.
+ ***********************************************************************/
+
+static struct gb_s gbCore;
+
+static WindowHandle gbWindow = 0;
+static Boolean gbStarted = FALSE;
+static Boolean gbRunning = FALSE;
+static Boolean gbWorkQueued = FALSE;
+
+static word gbStage = STAGE_UI_READY;
+static word gbFailureCode = 0;
+static enum gb_init_error_e gbInitResult = GB_INIT_INVALID_MAX;
+
+static word gbMode = MODE_CORE;
+static word gbCoreErrors = 0;
+static word gbLinesDrawn = 0;
+static word gbSteps = 0;
+
+static word gbMeasuredGuestFPS = 0;
+static word gbMeasuredBlitFPS = 0;
+static word gbGuestFramesInPeriod = 0;
+static word gbBlitsInPeriod = 0;
+static dword gbPeriodStart = 0;
+
+static MemHandle gb4Handle = 0;
+static GB4FrameBuffer *gb4Frame = NULL;
+
+static MemHandle gbMonoHandle = 0;
+static GBMonoFrameBuffer *gbMonoFrame = NULL;
+
+static MemHandle gbBank0Handle = 0;
+static MemHandle gbBank1Handle = 0;
+
+static FileHandle gbRomFile = 0;
+static Boolean gbDirPushed = FALSE;
+
+
+/***********************************************************************
+ * Application objects.
+ ***********************************************************************/
+
+@start AppResource;
+
+@object GenApplicationClass GBProfApp = {
+    GI_visMoniker = list {
+        @GBProfTextMoniker
+    }
+    GI_comp = @GBProfPrimary;
+    gcnList(MANUFACTURER_ID_GEOWORKS, GAGCNLT_WINDOWS) = @GBProfPrimary;
+}
+
+@visMoniker GBProfTextMoniker = "GB Profiler v0.3";
+
+@end AppResource;
+
+
+@start Interface;
+
+@object GenPrimaryClass GBProfPrimary = {
+    GI_comp = @GBProfView;
+    ATTR_GEN_DISPLAY_NOT_MINIMIZABLE;
+}
+
+@object GenViewClass GBProfView = {
+    GVI_content = process;
+
+    GVI_docBounds = {
+        0, 0,
+        560, 200
+    };
+
+    GVI_horizAttrs = @default | GVDA_NO_LARGER_THAN_CONTENT;
+    GVI_vertAttrs  = @default | GVDA_NO_LARGER_THAN_CONTENT;
+}
+
+@end Interface;
+
+
+/***********************************************************************
+ * Helpers.
+ ***********************************************************************/
+
+static void
+GBZeroBytes(byte *buffer, word count)
+{
+    while (count != 0) {
+        *buffer++ = 0;
+        count--;
+    }
+}
+
+
+static void
+GBWordToText(word value, char *buffer)
+{
+    char reverse[6];
+    word count;
+    word index;
+
+    if (value == 0) {
+        buffer[0] = '0';
+        buffer[1] = '\0';
+        return;
+    }
+
+    count = 0;
+
+    while ((value != 0) && (count < 5)) {
+        reverse[count] = (char)('0' + (value % 10));
+        value /= 10;
+        count++;
+    }
+
+    for (index = 0; index < count; index++) {
+        buffer[index] = reverse[count - index - 1];
+    }
+
+    buffer[count] = '\0';
+}
+
+
+static const char *
+GBBuildText(void)
+{
+#ifdef DO_ERROR_CHECKING
+    return "EC";
+#else
+    return "NC";
+#endif
+}
+
+
+static const char *
+GBModeText(void)
+{
+    switch (gbMode) {
+    case MODE_CORE:
+        return "1 CORE";
+    case MODE_RENDER:
+        return "2 RENDER";
+    case MODE_FULL_4BPP:
+        return "3 FULL 4BPP";
+    case MODE_BLIT_4BPP:
+        return "4 BLIT 4BPP";
+    case MODE_BLIT_MONO:
+        return "5 BLIT MONO";
+    }
+
+    return "?";
+}
+
+
+static const char *
+GBStageText(void)
+{
+    switch (gbStage) {
+    case STAGE_UI_READY:
+        return "UI READY";
+    case STAGE_ALLOC_4BPP:
+        return "ALLOC 4BPP";
+    case STAGE_ALLOC_MONO:
+        return "ALLOC MONO";
+    case STAGE_ALLOC_BANK0:
+        return "ALLOC BANK 0";
+    case STAGE_ALLOC_BANK1:
+        return "ALLOC BANK 1";
+    case STAGE_OPEN_FILE:
+        return "OPEN FLAPPY.GB";
+    case STAGE_READ_BANK0:
+        return "READ BANK 0";
+    case STAGE_READ_BANK1:
+        return "READ BANK 1";
+    case STAGE_VALIDATE_ROM:
+        return "VALIDATE ROM";
+    case STAGE_CALL_INIT:
+        return "CALL GB_INIT";
+    case STAGE_FIRST_FRAME:
+        return "FIRST FRAME";
+    case STAGE_RUNNING:
+        return "RUNNING";
+    case STAGE_FAILED:
+        return "FAILED";
+    }
+
+    return "UNKNOWN";
+}
+
+
+/***********************************************************************
+ * Buffer initialization.
+ ***********************************************************************/
+
+static void
+GBInit4Buffer(void)
+{
+    if (gb4Frame == NULL) {
+        return;
+    }
+
+    gb4Frame->header.B_width = GB_WIDTH;
+    gb4Frame->header.B_height = GB_HEIGHT;
+    gb4Frame->header.B_compact = BMC_UNCOMPACTED;
+    gb4Frame->header.B_type = BMF_4BIT;
+
+    GBZeroBytes(gb4Frame->pixels, GB_4BPP_FRAME_BYTES);
+}
+
+
+static void
+GBInitMonoBuffer(void)
+{
+    word y;
+    word x;
+    word rowBase;
+
+    if (gbMonoFrame == NULL) {
+        return;
+    }
+
+    gbMonoFrame->header.B_width = GB_WIDTH;
+    gbMonoFrame->header.B_height = GB_HEIGHT;
+    gbMonoFrame->header.B_compact = BMC_UNCOMPACTED;
+    gbMonoFrame->header.B_type = BMF_MONO;
+
+    /*
+     * Static checker pattern. Polarity is irrelevant to the throughput test.
+     */
+    for (y = 0; y < GB_HEIGHT; y++) {
+        rowBase = (word)(y * GB_MONO_BYTES_PER_LINE);
+
+        for (x = 0; x < GB_MONO_BYTES_PER_LINE; x++) {
+            gbMonoFrame->pixels[rowBase + x] =
+                (byte)(((x + y) & 1) ? 0xAA : 0x55);
+        }
+    }
+}
+
+
+/***********************************************************************
+ * Resource lifecycle.
+ ***********************************************************************/
+
+static void
+GBCloseFileAndPath(void)
+{
+    if (gbRomFile != 0) {
+        FileClose(gbRomFile, FALSE);
+        gbRomFile = 0;
+    }
+
+    if (gbDirPushed) {
+        FilePopDir();
+        gbDirPushed = FALSE;
+    }
+}
+
+
+static void
+GBFreeMemory(void)
+{
+    if (gbBank1Handle != 0) {
+        if (gbFastBank1 != NULL) {
+            MemUnlock(gbBank1Handle);
+        }
+
+        gbFastBank1 = NULL;
+        MemFree(gbBank1Handle);
+        gbBank1Handle = 0;
+    }
+
+    if (gbBank0Handle != 0) {
+        if (gbFastBank0 != NULL) {
+            MemUnlock(gbBank0Handle);
+        }
+
+        gbFastBank0 = NULL;
+        MemFree(gbBank0Handle);
+        gbBank0Handle = 0;
+    }
+
+    if (gbMonoHandle != 0) {
+        if (gbMonoFrame != NULL) {
+            MemUnlock(gbMonoHandle);
+        }
+
+        gbMonoFrame = NULL;
+        MemFree(gbMonoHandle);
+        gbMonoHandle = 0;
+    }
+
+    if (gb4Handle != 0) {
+        if (gb4Frame != NULL) {
+            MemUnlock(gb4Handle);
+        }
+
+        gb4Frame = NULL;
+        MemFree(gb4Handle);
+        gb4Handle = 0;
+    }
+}
+
+
+static void
+GBFail(word code)
+{
+    gbFailureCode = code;
+    gbStage = STAGE_FAILED;
+    gbRunning = FALSE;
+    gbWorkQueued = FALSE;
+
+    GBCloseFileAndPath();
+}
+
+
+/***********************************************************************
+ * Peanut-GB hooks.
+ ***********************************************************************/
+
+static void
+GBCoreErrorDirect(struct gb_s *gb,
+                  const int error,
+                  const unsigned short address)
+{
+    (void)gb;
+    (void)error;
+    (void)address;
+
+    gbCoreErrors++;
+}
+
+
+static void
+GBLcdLine(struct gb_s *gb,
+          const unsigned char *pixels,
+          const unsigned char line)
+{
+    static const byte shades[4] = {
+        C_WHITE,
+        C_RED,
+        C_GREEN,
+        C_BLACK
+    };
+
+    word x;
+    word rowBase;
+    byte left;
+    byte right;
+
+    (void)gb;
+
+    if ((gb4Frame == NULL) || (line >= GB_HEIGHT)) {
+        return;
+    }
+
+    rowBase = (word)((word)line * GB_4BPP_BYTES_PER_LINE);
+
+    for (x = 0; x < GB_WIDTH; x += 2) {
+        left = shades[pixels[x] & LCD_COLOUR];
+        right = shades[pixels[x + 1] & LCD_COLOUR];
+
+        gb4Frame->pixels[rowBase + (x >> 1)] =
+            (byte)((left << 4) | right);
+    }
+
+    gbLinesDrawn++;
+}
+
+
+/***********************************************************************
+ * Guest execution and measurement.
+ ***********************************************************************/
+
+static Boolean
+GBRunOneFrame(void)
+{
+    gbCore.gb_frame = 0;
+    gbLinesDrawn = 0;
+
+    for (gbSteps = 0;
+         gbSteps < GB_MAX_STEPS_PER_FRAME;
+         gbSteps++) {
+
+        __gb_step_cpu(&gbCore);
+
+        if (gbCore.gb_frame) {
+            return TRUE;
+        }
+    }
+
+    return FALSE;
+}
+
+
+static void
+GBResetMeasurement(void)
+{
+    gbMeasuredGuestFPS = 0;
+    gbMeasuredBlitFPS = 0;
+    gbGuestFramesInPeriod = 0;
+    gbBlitsInPeriod = 0;
+    gbPeriodStart = TimerGetCount();
+}
+
+
+static Boolean
+GBUpdateMeasurement(void)
+{
+    dword now;
+    dword elapsed;
+
+    now = TimerGetCount();
+    elapsed = now - gbPeriodStart;
+
+    /*
+     * Two-second window: stable enough even when the result is only 2-4 FPS.
+     */
+    if (elapsed < 120L) {
+        return FALSE;
+    }
+
+    gbMeasuredGuestFPS =
+        (word)(((dword)gbGuestFramesInPeriod * 60L) / elapsed);
+
+    gbMeasuredBlitFPS =
+        (word)(((dword)gbBlitsInPeriod * 60L) / elapsed);
+
+    gbGuestFramesInPeriod = 0;
+    gbBlitsInPeriod = 0;
+    gbPeriodStart = now;
+
+    return TRUE;
+}
+
+
+/***********************************************************************
+ * Drawing. The dynamic path never clears the whole window.
+ ***********************************************************************/
+
+static void
+GBDrawStaticScreen(GStateHandle gstate)
+{
+    GrSetAreaColor(gstate, CF_INDEX, C_WHITE, 0, 0);
+    GrFillRect(gstate, 0, 0, 559, 199);
+
+    GrSetTextColor(gstate, CF_INDEX, C_BLACK, 0, 0);
+    GrSetFont(gstate, FID_DTC_URW_SANS, MakeWWFixed(12.0));
+    GrDrawText(gstate, 12, 10, "GB PROFILER v0.3", 0);
+
+    if (gb4Frame != NULL) {
+        GrDrawImage(gstate,
+                    12,
+                    34,
+                    IBS_1,
+                    (const Bitmap *)gb4Frame);
+    }
+
+    GrSetLineColor(gstate, CF_INDEX, C_BLACK, 0, 0);
+    GrDrawRect(gstate, 11, 33, 172, 178);
+
+    GrSetFont(gstate, FID_DTC_URW_SANS, MakeWWFixed(9.0));
+
+    GrDrawText(gstate, 190, 34, "BUILD:", 0);
+    GrDrawText(gstate, 190, 52, "STATE:", 0);
+    GrDrawText(gstate, 190, 70, "MODE:", 0);
+    GrDrawText(gstate, 190, 88, "GUEST FPS:", 0);
+    GrDrawText(gstate, 190, 106, "BLIT FPS:", 0);
+    GrDrawText(gstate, 190, 124, "LCD LINES:", 0);
+    GrDrawText(gstate, 190, 142, "CPU STEPS:", 0);
+    GrDrawText(gstate, 190, 160, "CORE ERR:", 0);
+
+    GrDrawText(gstate, 330, 88, "1 CORE", 0);
+    GrDrawText(gstate, 330, 104, "2 RENDER", 0);
+    GrDrawText(gstate, 330, 120, "3 FULL 4BPP", 0);
+    GrDrawText(gstate, 330, 136, "4 BLIT 4BPP", 0);
+    GrDrawText(gstate, 330, 152, "5 BLIT MONO", 0);
+    GrDrawText(gstate, 330, 170, "Q QUIT / R RESET", 0);
+}
+
+
+static void
+GBDrawDynamicStatus(GStateHandle gstate)
+{
+    char text[6];
+
+    /*
+     * Clear only the value column. This removes the whole-screen white flash
+     * produced by the previous GBDrawScreen() implementation.
+     */
+    GrSetAreaColor(gstate, CF_INDEX, C_WHITE, 0, 0);
+    GrFillRect(gstate, 248, 30, 326, 178);
+
+    GrSetTextColor(gstate, CF_INDEX, C_BLACK, 0, 0);
+    GrSetFont(gstate, FID_DTC_URW_SANS, MakeWWFixed(9.0));
+
+    GrDrawText(gstate, 250, 34, GBBuildText(), 0);
+    GrDrawText(gstate, 250, 52, GBStageText(), 0);
+    GrDrawText(gstate, 250, 70, GBModeText(), 0);
+
+    GBWordToText(gbMeasuredGuestFPS, text);
+    GrDrawText(gstate, 290, 88, text, 0);
+
+    GBWordToText(gbMeasuredBlitFPS, text);
+    GrDrawText(gstate, 290, 106, text, 0);
+
+    GBWordToText(gbLinesDrawn, text);
+    GrDrawText(gstate, 290, 124, text, 0);
+
+    GBWordToText(gbSteps, text);
+    GrDrawText(gstate, 290, 142, text, 0);
+
+    GBWordToText(gbCoreErrors, text);
+    GrDrawText(gstate, 290, 160, text, 0);
+}
+
+
+static void
+GBRedrawAll(void)
+{
+    GStateHandle gstate;
+
+    if (gbWindow == 0) {
+        return;
+    }
+
+    gstate = GrCreateState(gbWindow);
+    GBDrawStaticScreen(gstate);
+    GBDrawDynamicStatus(gstate);
+    GrDestroyState(gstate);
+}
+
+
+static void
+GBRedrawStatus(void)
+{
+    GStateHandle gstate;
+
+    if (gbWindow == 0) {
+        return;
+    }
+
+    gstate = GrCreateState(gbWindow);
+    GBDrawDynamicStatus(gstate);
+    GrDestroyState(gstate);
+}
+
+
+static void
+GBBlit4(void)
+{
+    GStateHandle gstate;
+
+    if ((gbWindow == 0) || (gb4Frame == NULL)) {
+        return;
+    }
+
+    gstate = GrCreateState(gbWindow);
+    GrDrawImage(gstate,
+                12,
+                34,
+                IBS_1,
+                (const Bitmap *)gb4Frame);
+    GrDestroyState(gstate);
+}
+
+
+static void
+GBBlitMono(void)
+{
+    GStateHandle gstate;
+
+    if ((gbWindow == 0) || (gbMonoFrame == NULL)) {
+        return;
+    }
+
+    gstate = GrCreateState(gbWindow);
+    GrDrawImage(gstate,
+                12,
+                34,
+                IBS_1,
+                (const Bitmap *)gbMonoFrame);
+    GrDestroyState(gstate);
+}
+
+
+/***********************************************************************
+ * Core reset.
+ ***********************************************************************/
+
+static Boolean
+GBResetCore(void)
+{
+    GBZeroBytes((byte *)&gbCore, (word)sizeof(gbCore));
+
+    gbInitResult =
+        gb_init(&gbCore, NULL, NULL, NULL, NULL, NULL);
+
+    if (gbInitResult != GB_INIT_NO_ERROR) {
+        return FALSE;
+    }
+
+    gb_init_lcd(&gbCore, NULL);
+    gbCore.direct.joypad_state.joypad = 0xFF;
+
+    gbCoreErrors = 0;
+    return TRUE;
+}
+
+
+/***********************************************************************
+ * Work scheduling.
+ ***********************************************************************/
+
+static void
+GBQueueWork(void)
+{
+    if ((!gbWorkQueued) &&
+        gbRunning &&
+        (gbWindow != 0) &&
+        (gbStage == STAGE_RUNNING)) {
+
+        gbWorkQueued = TRUE;
+        @send, forceQueue process::MSG_GBPROF_WORK();
+    }
+}
+
+
+static void
+GBSetMode(word mode)
+{
+    if ((mode < MODE_CORE) || (mode > MODE_BLIT_MONO)) {
+        return;
+    }
+
+    gbMode = mode;
+    GBResetMeasurement();
+    GBRedrawStatus();
+    GBQueueWork();
+}
+
+
+/***********************************************************************
+ * Staged startup.
+ ***********************************************************************/
+
+static void
+GBQueueNextStage(void)
+{
+    @send, forceQueue process::MSG_GBPROF_NEXT_STAGE();
+}
+
+
+@method GBProfProcessClass, MSG_META_EXPOSED
+{
+    GStateHandle gstate;
+
+    gbWindow = win;
+
+    gstate = GrCreateState(win);
+    GrBeginUpdate(gstate);
+
+    GBDrawStaticScreen(gstate);
+    GBDrawDynamicStatus(gstate);
+
+    GrEndUpdate(gstate);
+    GrDestroyState(gstate);
+
+    if (!gbStarted) {
+        gbStarted = TRUE;
+        GBQueueNextStage();
+    } else if (gbStage == STAGE_RUNNING) {
+        gbRunning = TRUE;
+        GBResetMeasurement();
+        GBQueueWork();
+    }
+}
+
+
+@method GBProfProcessClass, MSG_GBPROF_NEXT_STAGE
+{
+    word bytesRead;
+
+    if ((gbWindow == 0) ||
+        (gbStage == STAGE_RUNNING) ||
+        (gbStage == STAGE_FAILED)) {
+
+        return;
+    }
+
+    gbStage++;
+    GBRedrawStatus();
+
+    switch (gbStage) {
+    case STAGE_ALLOC_4BPP:
+        gb4Handle =
+            MemAlloc((word)sizeof(GB4FrameBuffer),
+                     HF_SWAPABLE,
+                     HAF_STANDARD);
+
+        if (gb4Handle == 0) {
+            GBFail(8);
+            break;
+        }
+
+        gb4Frame =
+            (GB4FrameBuffer *)MemLock(gb4Handle);
+
+        if (gb4Frame == NULL) {
+            GBFail(9);
+            break;
+        }
+
+        GBInit4Buffer();
+        break;
+
+    case STAGE_ALLOC_MONO:
+        gbMonoHandle =
+            MemAlloc((word)sizeof(GBMonoFrameBuffer),
+                     HF_SWAPABLE,
+                     HAF_STANDARD);
+
+        if (gbMonoHandle == 0) {
+            GBFail(6);
+            break;
+        }
+
+        gbMonoFrame =
+            (GBMonoFrameBuffer *)MemLock(gbMonoHandle);
+
+        if (gbMonoFrame == NULL) {
+            GBFail(7);
+            break;
+        }
+
+        GBInitMonoBuffer();
+        break;
+
+    case STAGE_ALLOC_BANK0:
+        gbBank0Handle =
+            MemAlloc(16384, HF_SWAPABLE, HAF_STANDARD);
+
+        if (gbBank0Handle == 0) {
+            GBFail(10);
+            break;
+        }
+
+        gbFastBank0 = (byte *)MemLock(gbBank0Handle);
+
+        if (gbFastBank0 == NULL) {
+            GBFail(11);
+        }
+        break;
+
+    case STAGE_ALLOC_BANK1:
+        gbBank1Handle =
+            MemAlloc(16384, HF_SWAPABLE, HAF_STANDARD);
+
+        if (gbBank1Handle == 0) {
+            GBFail(12);
+            break;
+        }
+
+        gbFastBank1 = (byte *)MemLock(gbBank1Handle);
+
+        if (gbFastBank1 == NULL) {
+            GBFail(13);
+        }
+        break;
+
+    case STAGE_OPEN_FILE:
+        FilePushDir();
+        gbDirPushed = TRUE;
+
+        FileSetStandardPath(SP_APPLICATION);
+
+        gbRomFile =
+            FileOpen("ExtrApps\\FLAPPY.GB",
+                     FILE_ACCESS_R | FILE_DENY_W);
+
+        if (gbRomFile == 0) {
+            GBFail(20);
+        }
+        break;
+
+    case STAGE_READ_BANK0:
+        bytesRead =
+            FileRead(gbRomFile, gbFastBank0, 16384, FALSE);
+
+        if (bytesRead != 16384) {
+            GBFail(21);
+        }
+        break;
+
+    case STAGE_READ_BANK1:
+        bytesRead =
+            FileRead(gbRomFile, gbFastBank1, 16384, FALSE);
+
+        GBCloseFileAndPath();
+
+        if (bytesRead != 16384) {
+            GBFail(22);
+        }
+        break;
+
+    case STAGE_VALIDATE_ROM:
+        if ((gbFastBank0[0x0104] != 0xCE) ||
+            (gbFastBank0[0x0148] != 0x00)) {
+
+            GBFail(23);
+        }
+        break;
+
+    case STAGE_CALL_INIT:
+        if (!GBResetCore()) {
+            GBFail((word)(30 + gbInitResult));
+        }
+        break;
+
+    case STAGE_FIRST_FRAME:
+        gbRenderEnabled = TRUE;
+
+        if (!GBRunOneFrame()) {
+            GBFail(40);
+            break;
+        }
+
+        gbStage = STAGE_RUNNING;
+        gbRunning = TRUE;
+        gbFailureCode = 0;
+        gbMode = MODE_CORE;
+
+        GBResetMeasurement();
+        GBRedrawAll();
+        GBQueueWork();
+        return;
+    }
+
+    GBRedrawStatus();
+
+    if ((gbStage != STAGE_RUNNING) &&
+        (gbStage != STAGE_FAILED)) {
+
+        GBQueueNextStage();
+    }
+}
+
+
+/***********************************************************************
+ * Maximum-throughput worker.
+ ***********************************************************************/
+
+@method GBProfProcessClass, MSG_GBPROF_WORK
+{
+    Boolean updateStatus;
+
+    gbWorkQueued = FALSE;
+
+    if ((!gbRunning) ||
+        (gbWindow == 0) ||
+        (gbStage != STAGE_RUNNING)) {
+
+        return;
+    }
+
+    switch (gbMode) {
+    case MODE_CORE:
+        gbRenderEnabled = FALSE;
+
+        if (!GBRunOneFrame()) {
+            GBFail(40);
+            GBRedrawStatus();
+            return;
+        }
+
+        gbGuestFramesInPeriod++;
+        break;
+
+    case MODE_RENDER:
+        gbRenderEnabled = TRUE;
+
+        if (!GBRunOneFrame()) {
+            GBFail(40);
+            GBRedrawStatus();
+            return;
+        }
+
+        gbGuestFramesInPeriod++;
+        break;
+
+    case MODE_FULL_4BPP:
+        gbRenderEnabled = TRUE;
+
+        if (!GBRunOneFrame()) {
+            GBFail(40);
+            GBRedrawStatus();
+            return;
+        }
+
+        gbGuestFramesInPeriod++;
+        GBBlit4();
+        gbBlitsInPeriod++;
+        break;
+
+    case MODE_BLIT_4BPP:
+        GBBlit4();
+        gbBlitsInPeriod++;
+        break;
+
+    case MODE_BLIT_MONO:
+        GBBlitMono();
+        gbBlitsInPeriod++;
+        break;
+    }
+
+    updateStatus = GBUpdateMeasurement();
+
+    if (updateStatus) {
+        GBRedrawStatus();
+    }
+
+    GBQueueWork();
+}
+
+
+/***********************************************************************
+ * Reset and keyboard.
+ ***********************************************************************/
+
+@method GBProfProcessClass, MSG_GBPROF_RESET
+{
+    if ((gbStage != STAGE_RUNNING) ||
+        (gbFastBank0 == NULL)) {
+
+        return;
+    }
+
+    gbRunning = FALSE;
+    gbWorkQueued = FALSE;
+
+    GBInit4Buffer();
+
+    if (!GBResetCore()) {
+        GBFail((word)(30 + gbInitResult));
+        GBRedrawStatus();
+        return;
+    }
+
+    gbRenderEnabled = TRUE;
+
+    if (!GBRunOneFrame()) {
+        GBFail(40);
+        GBRedrawStatus();
+        return;
+    }
+
+    gbRunning = TRUE;
+    gbFailureCode = 0;
+    GBResetMeasurement();
+
+    GBRedrawAll();
+    GBQueueWork();
+}
+
+
+@method GBProfProcessClass, MSG_META_KBD_CHAR
+{
+    byte key;
+    byte mask;
+    Boolean pressed;
+
+    key = (byte)character;
+    mask = 0;
+
+    if (flags & CF_FIRST_PRESS) {
+        switch (key) {
+        case '1':
+            GBSetMode(MODE_CORE);
+            return;
+
+        case '2':
+            GBSetMode(MODE_RENDER);
+            return;
+
+        case '3':
+            GBSetMode(MODE_FULL_4BPP);
+            return;
+
+        case '4':
+            GBSetMode(MODE_BLIT_4BPP);
+            return;
+
+        case '5':
+            GBSetMode(MODE_BLIT_MONO);
+            return;
+
+        case 'r':
+        case 'R':
+            @send, forceQueue process::MSG_GBPROF_RESET();
+            return;
+
+        case 'q':
+        case 'Q':
+        case VC_ESCAPE:
+            gbRunning = FALSE;
+            gbWorkQueued = FALSE;
+            @send, forceQueue application::MSG_META_QUIT();
+            return;
+        }
+    }
+
+    switch (key) {
+    case VC_RIGHT:
+        mask = JOYPAD_RIGHT;
+        break;
+
+    case VC_LEFT:
+        mask = JOYPAD_LEFT;
+        break;
+
+    case VC_UP:
+        mask = JOYPAD_UP;
+        break;
+
+    case VC_DOWN:
+        mask = JOYPAD_DOWN;
+        break;
+
+    case 'z':
+    case 'Z':
+    case VC_BLANK:
+        mask = JOYPAD_A;
+        break;
+
+    case 'x':
+    case 'X':
+        mask = JOYPAD_B;
+        break;
+
+    case VC_ENTER:
+        mask = JOYPAD_START;
+        break;
+
+    case VC_TAB:
+        mask = JOYPAD_SELECT;
+        break;
+    }
+
+    if ((mask != 0) &&
+        (gbStage == STAGE_RUNNING) &&
+        (gbMode <= MODE_FULL_4BPP)) {
+
+        pressed = ((flags & CF_RELEASE) == 0);
+
+        if (pressed) {
+            gbCore.direct.joypad_state.joypad &=
+                (byte)(~mask);
+        } else {
+            gbCore.direct.joypad_state.joypad |= mask;
+        }
+
+        return;
+    }
+
+    @callsuper();
+}
+
+
+/***********************************************************************
+ * Lifecycle.
+ ***********************************************************************/
+
+@method GBProfProcessClass, MSG_META_CONTENT_VIEW_CLOSING
+{
+    gbWindow = 0;
+    gbWorkQueued = FALSE;
+    @callsuper();
+}
+
+
+@method GBProfProcessClass, MSG_META_DETACH
+{
+    gbRunning = FALSE;
+    gbWindow = 0;
+    gbWorkQueued = FALSE;
+
+    GBCloseFileAndPath();
+    GBFreeMemory();
+
+    @callsuper();
+}

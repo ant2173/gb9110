@@ -1,0 +1,1159 @@
+/***********************************************************************
+ *
+ * GBHW v0.2 -- Nokia 9110 hardware test build
+ *
+ * Features:
+ *   - external FLAPPY.GB ROM
+ *   - framebuffer in a separate locked GEOS memory block
+ *   - safe selectable speed: 10, 30, or 60 guest FPS
+ *   - 30 displayed FPS in 60-FPS mode
+ *   - keyboard/game controls
+ *   - timer stops when the view closes and resumes on re-expose
+ *   - Q/Escape requests a clean application quit
+ *   - bounded guest-frame execution
+ *
+ ***********************************************************************/
+
+@include <stdapp.goh>
+#include <graphics.h>
+#include <geode.h>
+#include <file.h>
+#include <timer.h>
+#include <input.h>
+
+#define ENABLE_SOUND 0
+#define ENABLE_LCD 1
+#define PEANUT_GB_12_COLOUR 0
+#define PEANUT_GB_HIGH_LCD_ACCURACY 0
+#define PEANUT_GB_USE_INTRINSICS 0
+#define PEANUT_GB_IS_LITTLE_ENDIAN 1
+
+#define GB_WIDTH                 160
+#define GB_HEIGHT                144
+#define GB_BYTES_PER_LINE         80
+#define GB_FRAME_BYTES         11520
+#define GB_MAX_STEPS_PER_FRAME 30000
+
+#define GB_SPEED_10                0
+#define GB_SPEED_30                1
+#define GB_SPEED_60                2
+
+#define STAGE_UI_READY             0
+#define STAGE_ALLOC_FRAMEBUFFER    1
+#define STAGE_ALLOC_BANK0          2
+#define STAGE_ALLOC_BANK1          3
+#define STAGE_OPEN_FILE            4
+#define STAGE_READ_BANK0           5
+#define STAGE_READ_BANK1           6
+#define STAGE_VALIDATE_ROM         7
+#define STAGE_CALL_INIT            8
+#define STAGE_FIRST_FRAME          9
+#define STAGE_RUNNING             10
+#define STAGE_FAILED             100
+
+struct gb_s;
+
+static unsigned char GBRomRead(struct gb_s *gb,
+                               const unsigned long address);
+static unsigned char GBCartRamRead(struct gb_s *gb,
+                                   const unsigned long address);
+static void GBCartRamWrite(struct gb_s *gb,
+                           const unsigned long address,
+                           const unsigned char value);
+static void GBCoreErrorDirect(struct gb_s *gb,
+                              const int error,
+                              const unsigned short address);
+static void GBLcdLine(struct gb_s *gb,
+                      const unsigned char *pixels,
+                      const unsigned char line);
+
+#define PGB_ROM_READ(gb, addr) \
+    GBRomRead((gb), (unsigned long)(addr))
+#define PGB_CART_RAM_READ(gb, addr) \
+    GBCartRamRead((gb), (unsigned long)(addr))
+#define PGB_CART_RAM_WRITE(gb, addr, val) \
+    GBCartRamWrite((gb), (unsigned long)(addr), (unsigned char)(val))
+#define PGB_REPORT_ERROR(gb, error, addr) \
+    GBCoreErrorDirect((gb), (int)(error), (unsigned short)(addr))
+#define PGB_LCD_AVAILABLE(gb) 1
+#define PGB_LCD_DRAW_LINE(gb, pixels, line) \
+    GBLcdLine((gb), (pixels), (unsigned char)(line))
+
+#include "PGBLCD.H"
+
+
+@class GBHWProcessClass, GenProcessClass;
+    @message void MSG_GBHW_NEXT_STAGE();
+    @message void MSG_GBHW_START_TIMER();
+    @message void MSG_GBHW_TICK();
+    @message void MSG_GBHW_RESET();
+@endc;
+
+@classdecl GBHWProcessClass, neverSaved;
+
+
+typedef struct {
+    Bitmap header;
+    byte pixels[GB_FRAME_BYTES];
+} GBFrameBuffer;
+
+
+/***********************************************************************
+ * Runtime state.
+ ***********************************************************************/
+
+static struct gb_s gbCore;
+
+static WindowHandle gbWindow = 0;
+static Boolean gbStarted = FALSE;
+static Boolean gbRunning = FALSE;
+static Boolean gbCaptureLCD = TRUE;
+
+static word gbStage = STAGE_UI_READY;
+static word gbFailureCode = 0;
+static enum gb_init_error_e gbInitResult = GB_INIT_INVALID_MAX;
+
+static word gbCoreErrors = 0;
+static word gbLinesDrawn = 0;
+static word gbSteps = 0;
+static word gbFrameCount = 0;
+
+static word gbSpeedMode = GB_SPEED_10;
+static word gbTimerTicks = 6;
+static word gbTargetGuestFPS = 10;
+
+static word gbMeasuredGuestFPS = 0;
+static word gbMeasuredVideoFPS = 0;
+static word gbGuestDeficit = 0;
+static word gbGuestFramesInPeriod = 0;
+static word gbVideoFramesInPeriod = 0;
+static dword gbPeriodStart = 0;
+
+static MemHandle gbFrameHandle = 0;
+static GBFrameBuffer *gbFrameBuffer = NULL;
+
+static MemHandle gbBank0Handle = 0;
+static MemHandle gbBank1Handle = 0;
+static byte *gbBank0 = NULL;
+static byte *gbBank1 = NULL;
+
+static FileHandle gbRomFile = 0;
+static Boolean gbDirPushed = FALSE;
+
+static TimerHandle gbTimerHandle = 0;
+static word gbTimerID = 0;
+
+
+/***********************************************************************
+ * Application objects.
+ ***********************************************************************/
+
+@start AppResource;
+
+@object GenApplicationClass GBHWApp = {
+    GI_visMoniker = list {
+        @GBHWTextMoniker
+    }
+    GI_comp = @GBHWPrimary;
+    gcnList(MANUFACTURER_ID_GEOWORKS, GAGCNLT_WINDOWS) = @GBHWPrimary;
+}
+
+@visMoniker GBHWTextMoniker = "GB HW Test v0.2";
+
+@end AppResource;
+
+
+@start Interface;
+
+@object GenPrimaryClass GBHWPrimary = {
+    GI_comp = @GBHWView;
+    ATTR_GEN_DISPLAY_NOT_MINIMIZABLE;
+}
+
+@object GenViewClass GBHWView = {
+    GVI_content = process;
+
+    GVI_docBounds = {
+        0, 0,
+        560, 200
+    };
+
+    GVI_horizAttrs = @default | GVDA_NO_LARGER_THAN_CONTENT;
+    GVI_vertAttrs  = @default | GVDA_NO_LARGER_THAN_CONTENT;
+}
+
+@end Interface;
+
+
+/***********************************************************************
+ * Basic helpers.
+ ***********************************************************************/
+
+static void
+GBZeroBytes(byte *buffer, word count)
+{
+    while (count != 0) {
+        *buffer++ = 0;
+        count--;
+    }
+}
+
+
+static void
+GBWordToText(word value, char *buffer)
+{
+    char reverse[6];
+    word count;
+    word index;
+
+    if (value == 0) {
+        buffer[0] = '0';
+        buffer[1] = '\0';
+        return;
+    }
+
+    count = 0;
+
+    while ((value != 0) && (count < 5)) {
+        reverse[count] = (char)('0' + (value % 10));
+        value /= 10;
+        count++;
+    }
+
+    for (index = 0; index < count; index++) {
+        buffer[index] = reverse[count - index - 1];
+    }
+
+    buffer[count] = '\0';
+}
+
+
+static const char *
+GBBuildText(void)
+{
+#ifdef DO_ERROR_CHECKING
+    return "EC";
+#else
+    return "NC";
+#endif
+}
+
+
+static const char *
+GBSpeedText(void)
+{
+    switch (gbSpeedMode) {
+    case GB_SPEED_10:
+        return "10/10";
+    case GB_SPEED_30:
+        return "30/30";
+    case GB_SPEED_60:
+        return "60/30";
+    }
+
+    return "?";
+}
+
+
+static void
+GBInitFrameBuffer(void)
+{
+    if (gbFrameBuffer == NULL) {
+        return;
+    }
+
+    gbFrameBuffer->header.B_width = GB_WIDTH;
+    gbFrameBuffer->header.B_height = GB_HEIGHT;
+    gbFrameBuffer->header.B_compact = BMC_UNCOMPACTED;
+    gbFrameBuffer->header.B_type = BMF_4BIT;
+
+    GBZeroBytes(gbFrameBuffer->pixels, GB_FRAME_BYTES);
+}
+
+
+/***********************************************************************
+ * Resource lifecycle.
+ ***********************************************************************/
+
+static void
+GBCloseFileAndPath(void)
+{
+    if (gbRomFile != 0) {
+        FileClose(gbRomFile, FALSE);
+        gbRomFile = 0;
+    }
+
+    if (gbDirPushed) {
+        FilePopDir();
+        gbDirPushed = FALSE;
+    }
+}
+
+
+static void
+GBFreeFramebuffer(void)
+{
+    if (gbFrameHandle != 0) {
+        if (gbFrameBuffer != NULL) {
+            MemUnlock(gbFrameHandle);
+        }
+
+        gbFrameBuffer = NULL;
+        MemFree(gbFrameHandle);
+        gbFrameHandle = 0;
+    }
+}
+
+
+static void
+GBFreeBanks(void)
+{
+    if (gbBank1Handle != 0) {
+        if (gbBank1 != NULL) {
+            MemUnlock(gbBank1Handle);
+        }
+
+        gbBank1 = NULL;
+        MemFree(gbBank1Handle);
+        gbBank1Handle = 0;
+    }
+
+    if (gbBank0Handle != 0) {
+        if (gbBank0 != NULL) {
+            MemUnlock(gbBank0Handle);
+        }
+
+        gbBank0 = NULL;
+        MemFree(gbBank0Handle);
+        gbBank0Handle = 0;
+    }
+}
+
+
+static void
+GBStopTimer(void)
+{
+    if (gbTimerHandle != 0) {
+        TimerStop(gbTimerHandle, gbTimerID);
+        gbTimerHandle = 0;
+        gbTimerID = 0;
+    }
+}
+
+
+static void
+GBFail(word code)
+{
+    gbFailureCode = code;
+    gbStage = STAGE_FAILED;
+    gbRunning = FALSE;
+
+    GBStopTimer();
+    GBCloseFileAndPath();
+}
+
+
+/***********************************************************************
+ * Direct Peanut-GB frontend hooks.
+ ***********************************************************************/
+
+static unsigned char
+GBRomRead(struct gb_s *gb, const unsigned long address)
+{
+    (void)gb;
+
+    if (address < 0x4000UL) {
+        return gbBank0[(word)address];
+    }
+
+    if (address < 0x8000UL) {
+        return gbBank1[(word)(address - 0x4000UL)];
+    }
+
+    return 0xFF;
+}
+
+
+static unsigned char
+GBCartRamRead(struct gb_s *gb, const unsigned long address)
+{
+    (void)gb;
+    (void)address;
+
+    return 0xFF;
+}
+
+
+static void
+GBCartRamWrite(struct gb_s *gb,
+               const unsigned long address,
+               const unsigned char value)
+{
+    (void)gb;
+    (void)address;
+    (void)value;
+}
+
+
+static void
+GBCoreErrorDirect(struct gb_s *gb,
+                  const int error,
+                  const unsigned short address)
+{
+    (void)gb;
+    (void)error;
+    (void)address;
+
+    gbCoreErrors++;
+}
+
+
+/***********************************************************************
+ * Real Peanut-GB scanline conversion.
+ ***********************************************************************/
+
+static void
+GBLcdLine(struct gb_s *gb,
+          const unsigned char *pixels,
+          const unsigned char line)
+{
+    static const byte shades[4] = {
+        C_WHITE,
+        C_RED,
+        C_GREEN,
+        C_BLACK
+    };
+
+    word x;
+    word rowBase;
+    byte left;
+    byte right;
+
+    (void)gb;
+
+    if ((!gbCaptureLCD) ||
+        (gbFrameBuffer == NULL) ||
+        (line >= GB_HEIGHT)) {
+
+        return;
+    }
+
+    rowBase = (word)((word)line * GB_BYTES_PER_LINE);
+
+    for (x = 0; x < GB_WIDTH; x += 2) {
+        left = shades[pixels[x] & LCD_COLOUR];
+        right = shades[pixels[x + 1] & LCD_COLOUR];
+
+        gbFrameBuffer->pixels[rowBase + (x >> 1)] =
+            (byte)((left << 4) | right);
+    }
+
+    gbLinesDrawn++;
+}
+
+
+/***********************************************************************
+ * Guest execution and counters.
+ ***********************************************************************/
+
+static Boolean
+GBRunOneFrame(void)
+{
+    gbCore.gb_frame = 0;
+
+    if (gbCaptureLCD) {
+        gbLinesDrawn = 0;
+    }
+
+    for (gbSteps = 0;
+         gbSteps < GB_MAX_STEPS_PER_FRAME;
+         gbSteps++) {
+
+        __gb_step_cpu(&gbCore);
+
+        if (gbCore.gb_frame) {
+            return TRUE;
+        }
+    }
+
+    return FALSE;
+}
+
+
+static void
+GBResetCounters(void)
+{
+    gbMeasuredGuestFPS = 0;
+    gbMeasuredVideoFPS = 0;
+    gbGuestDeficit = 0;
+
+    gbGuestFramesInPeriod = 0;
+    gbVideoFramesInPeriod = 0;
+    gbPeriodStart = TimerGetCount();
+}
+
+
+static Boolean
+GBUpdateFPS(void)
+{
+    dword now;
+    dword elapsed;
+
+    now = TimerGetCount();
+    elapsed = now - gbPeriodStart;
+
+    if (elapsed < 60L) {
+        return FALSE;
+    }
+
+    gbMeasuredGuestFPS =
+        (word)(((dword)gbGuestFramesInPeriod * 60L) / elapsed);
+
+    gbMeasuredVideoFPS =
+        (word)(((dword)gbVideoFramesInPeriod * 60L) / elapsed);
+
+    if (gbMeasuredGuestFPS < gbTargetGuestFPS) {
+        gbGuestDeficit =
+            (word)(gbTargetGuestFPS - gbMeasuredGuestFPS);
+    } else {
+        gbGuestDeficit = 0;
+    }
+
+    gbGuestFramesInPeriod = 0;
+    gbVideoFramesInPeriod = 0;
+    gbPeriodStart = now;
+
+    return TRUE;
+}
+
+
+/***********************************************************************
+ * UI.
+ ***********************************************************************/
+
+static const char *
+GBStageText(void)
+{
+    switch (gbStage) {
+    case STAGE_UI_READY:
+        return "UI READY";
+    case STAGE_ALLOC_FRAMEBUFFER:
+        return "ALLOC FRAMEBUF";
+    case STAGE_ALLOC_BANK0:
+        return "ALLOC BANK 0";
+    case STAGE_ALLOC_BANK1:
+        return "ALLOC BANK 1";
+    case STAGE_OPEN_FILE:
+        return "OPEN FLAPPY.GB";
+    case STAGE_READ_BANK0:
+        return "READ BANK 0";
+    case STAGE_READ_BANK1:
+        return "READ BANK 1";
+    case STAGE_VALIDATE_ROM:
+        return "VALIDATE ROM";
+    case STAGE_CALL_INIT:
+        return "CALL GB_INIT";
+    case STAGE_FIRST_FRAME:
+        return "FIRST FRAME";
+    case STAGE_RUNNING:
+        return "RUNNING";
+    case STAGE_FAILED:
+        return "FAILED";
+    }
+
+    return "UNKNOWN";
+}
+
+
+static void
+GBDrawScreen(GStateHandle gstate)
+{
+    char text[6];
+
+    GrSetAreaColor(gstate, CF_INDEX, C_WHITE, 0, 0);
+    GrFillRect(gstate, 0, 0, 559, 199);
+
+    GrSetTextColor(gstate, CF_INDEX, C_BLACK, 0, 0);
+    GrSetFont(gstate, FID_DTC_URW_SANS, MakeWWFixed(12.0));
+    GrDrawText(gstate, 12, 10, "GB HW TEST v0.2", 0);
+
+    if (gbFrameBuffer != NULL) {
+        GrDrawImage(gstate,
+                    12,
+                    34,
+                    IBS_1,
+                    (const Bitmap *)gbFrameBuffer);
+    }
+
+    GrSetLineColor(gstate, CF_INDEX, C_BLACK, 0, 0);
+    GrDrawRect(gstate, 11, 33, 172, 178);
+
+    GrSetFont(gstate, FID_DTC_URW_SANS, MakeWWFixed(9.0));
+
+    GrDrawText(gstate, 190, 34, "BUILD:", 0);
+    GrDrawText(gstate, 250, 34, GBBuildText(), 0);
+
+    GrDrawText(gstate, 310, 34, "MODE:", 0);
+    GrDrawText(gstate, 365, 34, GBSpeedText(), 0);
+
+    GrDrawText(gstate, 190, 52, "STATE:", 0);
+    GrDrawText(gstate, 250, 52, GBStageText(), 0);
+
+    GrDrawText(gstate, 190, 70, "FAIL:", 0);
+    GBWordToText(gbFailureCode, text);
+    GrDrawText(gstate, 250, 70, text, 0);
+
+    GrDrawText(gstate, 190, 88, "GUEST FPS:", 0);
+    GBWordToText(gbMeasuredGuestFPS, text);
+    GrDrawText(gstate, 290, 88, text, 0);
+
+    GrDrawText(gstate, 190, 106, "VIDEO FPS:", 0);
+    GBWordToText(gbMeasuredVideoFPS, text);
+    GrDrawText(gstate, 290, 106, text, 0);
+
+    GrDrawText(gstate, 190, 124, "DEFICIT:", 0);
+    GBWordToText(gbGuestDeficit, text);
+    GrDrawText(gstate, 270, 124, text, 0);
+
+    GrDrawText(gstate, 330, 124, "LINES:", 0);
+    GBWordToText(gbLinesDrawn, text);
+    GrDrawText(gstate, 390, 124, text, 0);
+
+    GrDrawText(gstate, 190, 142, "STEPS:", 0);
+    GBWordToText(gbSteps, text);
+    GrDrawText(gstate, 255, 142, text, 0);
+
+    GrDrawText(gstate, 330, 142, "ERR:", 0);
+    GBWordToText(gbCoreErrors, text);
+    GrDrawText(gstate, 375, 142, text, 0);
+
+    GrDrawText(gstate, 190, 160, "1=10  2=30  3=60/30", 0);
+    GrDrawText(gstate, 350, 160, "Q=QUIT R=RESET", 0);
+
+    GrDrawText(gstate, 190, 176, "ARROWS Z/SPACE X ENTER TAB", 0);
+}
+
+
+static void
+GBRedraw(void)
+{
+    GStateHandle gstate;
+
+    if (gbWindow == 0) {
+        return;
+    }
+
+    gstate = GrCreateState(gbWindow);
+    GBDrawScreen(gstate);
+    GrDestroyState(gstate);
+}
+
+
+/***********************************************************************
+ * Speed selection and timer lifecycle.
+ ***********************************************************************/
+
+static void
+GBConfigureSpeed(word mode)
+{
+    GBStopTimer();
+
+    gbSpeedMode = mode;
+
+    switch (mode) {
+    case GB_SPEED_10:
+        gbTimerTicks = 6;
+        gbTargetGuestFPS = 10;
+        break;
+
+    case GB_SPEED_30:
+        gbTimerTicks = 2;
+        gbTargetGuestFPS = 30;
+        break;
+
+    default:
+        gbSpeedMode = GB_SPEED_60;
+        gbTimerTicks = 1;
+        gbTargetGuestFPS = 60;
+        break;
+    }
+
+    gbFrameCount = 0;
+    GBResetCounters();
+
+    if (gbRunning && (gbStage == STAGE_RUNNING)) {
+        @send, forceQueue process::MSG_GBHW_START_TIMER();
+    }
+
+    GBRedraw();
+}
+
+
+static void
+GBStartTimer(void)
+{
+    optr processOptr;
+
+    if ((!gbRunning) ||
+        (gbWindow == 0) ||
+        (gbStage != STAGE_RUNNING) ||
+        (gbTimerHandle != 0)) {
+
+        return;
+    }
+
+    processOptr = ConstructOptr(GeodeGetProcessHandle(), 0);
+
+    gbTimerHandle = TimerStart(TIMER_EVENT_CONTINUAL,
+                               processOptr,
+                               gbTimerTicks,
+                               MSG_GBHW_TICK,
+                               gbTimerTicks,
+                               &gbTimerID);
+}
+
+
+/***********************************************************************
+ * Core reset without reopening the ROM.
+ ***********************************************************************/
+
+static Boolean
+GBResetCore(void)
+{
+    GBZeroBytes((byte *)&gbCore, (word)sizeof(gbCore));
+
+    gbInitResult =
+        gb_init(&gbCore, NULL, NULL, NULL, NULL, NULL);
+
+    if (gbInitResult != GB_INIT_NO_ERROR) {
+        return FALSE;
+    }
+
+    gb_init_lcd(&gbCore, NULL);
+    gbCore.direct.joypad_state.joypad = 0xFF;
+
+    gbCoreErrors = 0;
+    gbCaptureLCD = TRUE;
+
+    return TRUE;
+}
+
+
+/***********************************************************************
+ * Staged startup.
+ ***********************************************************************/
+
+static void
+GBQueueNextStage(void)
+{
+    @send, forceQueue process::MSG_GBHW_NEXT_STAGE();
+}
+
+
+@method GBHWProcessClass, MSG_META_EXPOSED
+{
+    GStateHandle gstate;
+
+    gbWindow = win;
+
+    gstate = GrCreateState(win);
+    GrBeginUpdate(gstate);
+
+    GBDrawScreen(gstate);
+
+    GrEndUpdate(gstate);
+    GrDestroyState(gstate);
+
+    if (!gbStarted) {
+        gbStarted = TRUE;
+        GBQueueNextStage();
+    } else if ((gbStage == STAGE_RUNNING) &&
+               (gbTimerHandle == 0)) {
+
+        gbRunning = TRUE;
+        GBResetCounters();
+        @send, forceQueue process::MSG_GBHW_START_TIMER();
+    }
+}
+
+
+@method GBHWProcessClass, MSG_GBHW_NEXT_STAGE
+{
+    word bytesRead;
+
+    if ((gbWindow == 0) ||
+        (gbStage == STAGE_RUNNING) ||
+        (gbStage == STAGE_FAILED)) {
+
+        return;
+    }
+
+    gbStage++;
+    GBRedraw();
+
+    switch (gbStage) {
+    case STAGE_ALLOC_FRAMEBUFFER:
+        gbFrameHandle =
+            MemAlloc((word)sizeof(GBFrameBuffer),
+                     HF_SWAPABLE,
+                     HAF_STANDARD);
+
+        if (gbFrameHandle == 0) {
+            GBFail(8);
+            break;
+        }
+
+        gbFrameBuffer =
+            (GBFrameBuffer *)MemLock(gbFrameHandle);
+
+        if (gbFrameBuffer == NULL) {
+            GBFail(9);
+            break;
+        }
+
+        GBInitFrameBuffer();
+        break;
+
+    case STAGE_ALLOC_BANK0:
+        gbBank0Handle =
+            MemAlloc(16384, HF_SWAPABLE, HAF_STANDARD);
+
+        if (gbBank0Handle == 0) {
+            GBFail(10);
+            break;
+        }
+
+        gbBank0 = (byte *)MemLock(gbBank0Handle);
+
+        if (gbBank0 == NULL) {
+            GBFail(11);
+        }
+        break;
+
+    case STAGE_ALLOC_BANK1:
+        gbBank1Handle =
+            MemAlloc(16384, HF_SWAPABLE, HAF_STANDARD);
+
+        if (gbBank1Handle == 0) {
+            GBFail(12);
+            break;
+        }
+
+        gbBank1 = (byte *)MemLock(gbBank1Handle);
+
+        if (gbBank1 == NULL) {
+            GBFail(13);
+        }
+        break;
+
+    case STAGE_OPEN_FILE:
+        FilePushDir();
+        gbDirPushed = TRUE;
+
+        FileSetStandardPath(SP_APPLICATION);
+
+        gbRomFile =
+            FileOpen("ExtrApps\\FLAPPY.GB",
+                     FILE_ACCESS_R | FILE_DENY_W);
+
+        if (gbRomFile == 0) {
+            GBFail(20);
+        }
+        break;
+
+    case STAGE_READ_BANK0:
+        bytesRead =
+            FileRead(gbRomFile, gbBank0, 16384, FALSE);
+
+        if (bytesRead != 16384) {
+            GBFail(21);
+        }
+        break;
+
+    case STAGE_READ_BANK1:
+        bytesRead =
+            FileRead(gbRomFile, gbBank1, 16384, FALSE);
+
+        GBCloseFileAndPath();
+
+        if (bytesRead != 16384) {
+            GBFail(22);
+        }
+        break;
+
+    case STAGE_VALIDATE_ROM:
+        if ((gbBank0[0x0104] != 0xCE) ||
+            (gbBank0[0x0148] != 0x00)) {
+
+            GBFail(23);
+        }
+        break;
+
+    case STAGE_CALL_INIT:
+        if (!GBResetCore()) {
+            GBFail((word)(30 + gbInitResult));
+        }
+        break;
+
+    case STAGE_FIRST_FRAME:
+        gbCaptureLCD = TRUE;
+
+        if (!GBRunOneFrame()) {
+            GBFail(40);
+            break;
+        }
+
+        gbStage = STAGE_RUNNING;
+        gbRunning = TRUE;
+        gbFailureCode = 0;
+
+        GBConfigureSpeed(GB_SPEED_10);
+        return;
+    }
+
+    GBRedraw();
+
+    if ((gbStage != STAGE_RUNNING) &&
+        (gbStage != STAGE_FAILED)) {
+
+        GBQueueNextStage();
+    }
+}
+
+
+/***********************************************************************
+ * Timer messages.
+ ***********************************************************************/
+
+@method GBHWProcessClass, MSG_GBHW_START_TIMER
+{
+    GBStartTimer();
+}
+
+
+@method GBHWProcessClass, MSG_GBHW_TICK
+{
+    GStateHandle gstate;
+    Boolean displayThisFrame;
+    Boolean updateStatus;
+
+    if ((!gbRunning) ||
+        (gbWindow == 0) ||
+        (gbStage != STAGE_RUNNING)) {
+
+        return;
+    }
+
+    /*
+     * In 10 and 30 modes every guest frame is displayed.
+     * In 60 mode only every second guest frame is packed and displayed.
+     */
+    if (gbSpeedMode == GB_SPEED_60) {
+        displayThisFrame = ((gbFrameCount & 1) != 0);
+    } else {
+        displayThisFrame = TRUE;
+    }
+
+    gbCaptureLCD = displayThisFrame;
+
+    if (!GBRunOneFrame()) {
+        GBFail(40);
+        GBRedraw();
+        return;
+    }
+
+    gbFrameCount++;
+    gbGuestFramesInPeriod++;
+
+    if (displayThisFrame) {
+        gbVideoFramesInPeriod++;
+    }
+
+    updateStatus = GBUpdateFPS();
+
+    if (displayThisFrame || updateStatus) {
+        gstate = GrCreateState(gbWindow);
+
+        if (displayThisFrame && (gbFrameBuffer != NULL)) {
+            GrDrawImage(gstate,
+                        12,
+                        34,
+                        IBS_1,
+                        (const Bitmap *)gbFrameBuffer);
+        }
+
+        if (updateStatus) {
+            GBDrawScreen(gstate);
+        }
+
+        GrDestroyState(gstate);
+    }
+}
+
+
+/***********************************************************************
+ * Reset.
+ ***********************************************************************/
+
+@method GBHWProcessClass, MSG_GBHW_RESET
+{
+    if ((gbStage != STAGE_RUNNING) ||
+        (gbBank0 == NULL) ||
+        (gbFrameBuffer == NULL)) {
+
+        return;
+    }
+
+    GBStopTimer();
+    gbRunning = FALSE;
+
+    GBInitFrameBuffer();
+
+    if (!GBResetCore()) {
+        GBFail((word)(30 + gbInitResult));
+        GBRedraw();
+        return;
+    }
+
+    gbCaptureLCD = TRUE;
+
+    if (!GBRunOneFrame()) {
+        GBFail(40);
+        GBRedraw();
+        return;
+    }
+
+    gbRunning = TRUE;
+    gbFailureCode = 0;
+    gbFrameCount = 0;
+    GBResetCounters();
+
+    GBRedraw();
+    @send, forceQueue process::MSG_GBHW_START_TIMER();
+}
+
+
+/***********************************************************************
+ * Keyboard input.
+ ***********************************************************************/
+
+@method GBHWProcessClass, MSG_META_KBD_CHAR
+{
+    byte key;
+    byte mask;
+    Boolean pressed;
+
+    key = (byte)character;
+    mask = 0;
+
+    if (flags & CF_FIRST_PRESS) {
+        switch (key) {
+        case '1':
+            GBConfigureSpeed(GB_SPEED_10);
+            return;
+
+        case '2':
+            GBConfigureSpeed(GB_SPEED_30);
+            return;
+
+        case '3':
+            GBConfigureSpeed(GB_SPEED_60);
+            return;
+
+        case 'r':
+        case 'R':
+            @send, forceQueue process::MSG_GBHW_RESET();
+            return;
+
+        case 'q':
+        case 'Q':
+        case VC_ESCAPE:
+            gbRunning = FALSE;
+            GBStopTimer();
+            @send, forceQueue application::MSG_META_QUIT();
+            return;
+        }
+    }
+
+    switch (key) {
+    case VC_RIGHT:
+        mask = JOYPAD_RIGHT;
+        break;
+
+    case VC_LEFT:
+        mask = JOYPAD_LEFT;
+        break;
+
+    case VC_UP:
+        mask = JOYPAD_UP;
+        break;
+
+    case VC_DOWN:
+        mask = JOYPAD_DOWN;
+        break;
+
+    case 'z':
+    case 'Z':
+    case VC_BLANK:
+        mask = JOYPAD_A;
+        break;
+
+    case 'x':
+    case 'X':
+        mask = JOYPAD_B;
+        break;
+
+    case VC_ENTER:
+        mask = JOYPAD_START;
+        break;
+
+    case VC_TAB:
+        mask = JOYPAD_SELECT;
+        break;
+    }
+
+    if ((mask != 0) && (gbStage == STAGE_RUNNING)) {
+        pressed = ((flags & CF_RELEASE) == 0);
+
+        if (pressed) {
+            gbCore.direct.joypad_state.joypad &=
+                (byte)(~mask);
+        } else {
+            gbCore.direct.joypad_state.joypad |= mask;
+        }
+
+        return;
+    }
+
+    @callsuper();
+}
+
+
+/***********************************************************************
+ * View/application lifecycle.
+ ***********************************************************************/
+
+@method GBHWProcessClass, MSG_META_CONTENT_VIEW_CLOSING
+{
+    /*
+     * Keep core and ROM state, but stop consuming CPU while the view is
+     * closed or another application is active. MSG_META_EXPOSED resumes it.
+     */
+    gbWindow = 0;
+    GBStopTimer();
+    @callsuper();
+}
+
+
+@method GBHWProcessClass, MSG_META_DETACH
+{
+    gbRunning = FALSE;
+    gbWindow = 0;
+
+    GBStopTimer();
+    GBCloseFileAndPath();
+    GBFreeBanks();
+    GBFreeFramebuffer();
+
+    @callsuper();
+}

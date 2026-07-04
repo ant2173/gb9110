@@ -1,0 +1,33 @@
+# GEOS/Borland generated files
+*.GEO
+*.geo
+*.OBJ
+*.obj
+*.EOBJ
+*.eobj
+*.EC
+*.ec
+*.MAP
+*.map
+*.SYM
+*.sym
+*.LST
+*.lst
+*.tmp
+DEPENDENCIES.MK
+dependencies.mk
+Makefile
+
+# ROMs and save files
+*.gb
+*.gbc
+*.sav
+
+# Archives and editor files
+*.zip
+*.7z
+*.rar
+*.bak
+*.swp
+Thumbs.db
+.DS_Store

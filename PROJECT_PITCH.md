@@ -1,0 +1,3 @@
+# One-paragraph project pitch
+
+GB9110 is an open experiment in running a Game Boy emulator on the Nokia 9110 Communicator using the original PC/GEOS SDK and Borland C++ 4.52. A real ROM already loads, executes, renders, and accepts input on actual hardware. The project is now profiler-driven: the CPU-only path reaches about 21–22 FPS, the original PPU reduces this to 7 FPS, and the complete display path reaches about 5 FPS. The repository documents both successful milestones and failed optimizations while exploring renderer redesign, adaptive frame skipping, and eventually 16-bit x86 core optimization.
