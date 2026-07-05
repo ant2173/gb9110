@@ -1,0 +1,195 @@
+--- PGBROW.H.v1
++++ PGBROW.H.v2
+@@ -656,8 +656,36 @@
+ #define PGB_DIV_SUPER_ENABLED(gb) 0
+ #endif
+ 
++/*
++ * Optional division helper level supplied by the frontend:
++ *   0 = disabled
++ *   1 = complete-iteration helper only (DIV v1)
++ *   2 = complete helper plus prefix/final helpers (DIV v2)
++ */
++#ifndef PGB_DIV_SUPER_LEVEL
++#define PGB_DIV_SUPER_LEVEL(gb) \
++    (PGB_DIV_SUPER_ENABLED(gb) ? 1 : 0)
++#endif
++
++#ifndef PGB_DIV_FULL_HIT
++#define PGB_DIV_FULL_HIT() ((void)0)
++#endif
++
++#ifndef PGB_DIV_PREFIX_HIT
++#define PGB_DIV_PREFIX_HIT() ((void)0)
++#endif
++
++#ifndef PGB_DIV_FINAL_HIT
++#define PGB_DIV_FINAL_HIT() ((void)0)
++#endif
++
++#ifndef PGB_DIV_FALLBACK_HIT
++#define PGB_DIV_FALLBACK_HIT() ((void)0)
++#endif
++
++/* Compatibility with frontends built for the original helper. */
+ #ifndef PGB_DIV_SUPER_HIT
+-#define PGB_DIV_SUPER_HIT() ((void)0)
++#define PGB_DIV_SUPER_HIT() PGB_DIV_FULL_HIT()
+ #endif
+ 
+ #ifndef PGB_DISABLE_RTC
+@@ -2078,6 +2106,97 @@
+ 
+ 
+ /*
++ * Collapse only the first five instructions of the same division loop:
++ *   PUSH AF / RL L / RL H / RL C / RL B
++ *
++ * This 48-cycle block is much easier to fit before the next LCD or timer
++ * boundary than the complete 144-160 cycle iteration. Execution resumes at
++ * 0x23D7 (PUSH BC), so all remaining instructions retain normal interrupt
++ * and timing granularity.
++ */
++static uint_fast16_t
++__gb_div_prefix_fast(struct gb_s *gb)
++{
++    uint8_t carry;
++    uint8_t old_value;
++
++    PGB_STACK_PUSH8(gb, gb->cpu_reg.a);
++    PGB_STACK_PUSH8(gb, gb->cpu_reg.f);
++
++    carry = (gb->cpu_reg.f & PGB_FLAG_C) ? 1 : 0;
++
++    old_value = gb->cpu_reg.hl.bytes.l;
++    gb->cpu_reg.hl.bytes.l =
++        (uint8_t)((old_value << 1) | carry);
++    carry = (uint8_t)(old_value >> 7);
++
++    old_value = gb->cpu_reg.hl.bytes.h;
++    gb->cpu_reg.hl.bytes.h =
++        (uint8_t)((old_value << 1) | carry);
++    carry = (uint8_t)(old_value >> 7);
++
++    old_value = gb->cpu_reg.bc.bytes.c;
++    gb->cpu_reg.bc.bytes.c =
++        (uint8_t)((old_value << 1) | carry);
++    carry = (uint8_t)(old_value >> 7);
++
++    old_value = gb->cpu_reg.bc.bytes.b;
++    gb->cpu_reg.bc.bytes.b =
++        (uint8_t)((old_value << 1) | carry);
++    carry = (uint8_t)(old_value >> 7);
++
++    /* Flags left by CB 10 (RL B). */
++    gb->cpu_reg.f =
++        (uint8_t)((gb->cpu_reg.bc.bytes.b == 0 ? PGB_FLAG_Z : 0) |
++        (carry ? PGB_FLAG_C : 0));
++
++    gb->cpu_reg.pc.reg = 0x23D7;
++    return 48;
++}
++
++
++/*
++ * Collapse the fixed epilogue at 0x23F2:
++ *   LD D,B / LD E,C / RL L / LD C,L / RL H / LD B,H / OR A / RET
++ *
++ * The current carry flag is an input to RL L and therefore must be preserved
++ * until the first shift. The helper reproduces the final registers, flags,
++ * stack pointer and return address in 52 guest cycles.
++ */
++static uint_fast16_t
++__gb_div_final_fast(struct gb_s *gb)
++{
++    uint8_t carry;
++    uint8_t old_value;
++
++    gb->cpu_reg.de.bytes.d = gb->cpu_reg.bc.bytes.b;
++    gb->cpu_reg.de.bytes.e = gb->cpu_reg.bc.bytes.c;
++
++    carry = (gb->cpu_reg.f & PGB_FLAG_C) ? 1 : 0;
++
++    old_value = gb->cpu_reg.hl.bytes.l;
++    gb->cpu_reg.hl.bytes.l =
++        (uint8_t)((old_value << 1) | carry);
++    carry = (uint8_t)(old_value >> 7);
++    gb->cpu_reg.bc.bytes.c = gb->cpu_reg.hl.bytes.l;
++
++    old_value = gb->cpu_reg.hl.bytes.h;
++    gb->cpu_reg.hl.bytes.h =
++        (uint8_t)((old_value << 1) | carry);
++    gb->cpu_reg.bc.bytes.b = gb->cpu_reg.hl.bytes.h;
++
++    /* OR A: A is unchanged; Z follows A, N/H/C are cleared. */
++    gb->cpu_reg.f =
++        (gb->cpu_reg.a == 0) ? PGB_FLAG_Z : 0;
++
++    gb->cpu_reg.pc.bytes.c = PGB_STACK_POP8(gb);
++    gb->cpu_reg.pc.bytes.p = PGB_STACK_POP8(gb);
++
++    return 52;
++}
++
++
++/*
+  * The normal timing code assumes one instruction cannot jump over several
+  * LCD phases. A collapsed division iteration is up to 160 cycles, so only
+  * use it when the complete iteration fits before the next LCD boundary.
+@@ -2224,18 +2343,46 @@
+ 		}
+ 	}
+ 	/*
+-	 * Runtime A/B fast path. The frontend validates the exact ROM bytes and
+-	 * enables this only in modes 6 and 7.
++	 * Runtime-selectable helpers for the validated SDCC/GBDK division loop.
++	 * DIV v1 collapses a complete iteration when 160 cycles fit safely.
++	 * DIV v2 falls back to a 48-cycle prefix and also collapses the fixed
++	 * 52-cycle epilogue, recovering work near LCD/timer boundaries.
+ 	 */
+-	if(PGB_DIV_SUPER_ENABLED(gb) &&
+-	   gb->cpu_reg.pc.reg == 0x23CE &&
+-	   gb->cpu_reg.a != 0 &&
+-	   gb->cpu_reg.a <= 16 &&
+-	   __gb_div_iteration_timing_safe(gb, 160))
++	if(PGB_DIV_SUPER_LEVEL(gb) != 0)
+ 	{
+-		inst_cycles = __gb_div_iteration_fast(gb);
+-		PGB_DIV_SUPER_HIT();
+-		goto pgb_timing;
++		if(gb->cpu_reg.pc.reg == 0x23CE &&
++		   gb->cpu_reg.a != 0 &&
++		   gb->cpu_reg.a <= 16)
++		{
++			if(__gb_div_iteration_timing_safe(gb, 160))
++			{
++				inst_cycles = __gb_div_iteration_fast(gb);
++				PGB_DIV_FULL_HIT();
++				goto pgb_timing;
++			}
++
++			if(PGB_DIV_SUPER_LEVEL(gb) >= 2 &&
++			   __gb_div_iteration_timing_safe(gb, 48))
++			{
++				inst_cycles = __gb_div_prefix_fast(gb);
++				PGB_DIV_PREFIX_HIT();
++				goto pgb_timing;
++			}
++
++			PGB_DIV_FALLBACK_HIT();
++		}
++		else if(PGB_DIV_SUPER_LEVEL(gb) >= 2 &&
++		        gb->cpu_reg.pc.reg == 0x23F2)
++		{
++			if(__gb_div_iteration_timing_safe(gb, 52))
++			{
++				inst_cycles = __gb_div_final_fast(gb);
++				PGB_DIV_FINAL_HIT();
++				goto pgb_timing;
++			}
++
++			PGB_DIV_FALLBACK_HIT();
++		}
+ 	}
+ 
+ 	/* Obtain opcode */

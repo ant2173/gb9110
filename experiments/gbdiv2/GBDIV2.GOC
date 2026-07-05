@@ -1,0 +1,2441 @@
+/***********************************************************************
+ *
+ * GBDIV2 v1.6 -- DIV v1 versus DIV v2 benchmark
+ *
+ * Keyboard modes:
+ *   1 CORE baseline     renderer off, division helpers off
+ *   2 CORE DIV v1       complete-iteration helper only
+ *   3 CORE DIV v2       complete + 48-cycle prefix + 52-cycle final
+ *   4 FS2 baseline      ROW8, draw one frame of two, helpers off
+ *   5 FS2 DIV v1        ROW8 FS2 with complete helper only
+ *   6 FS2 DIV v2        ROW8 FS2 with all DIV v2 helpers
+ *   7 FULL baseline     ROW8 and blit every frame, helpers off
+ *   8 FULL DIV v1       ROW8 full with complete helper only
+ *   9 FULL DIV v2       ROW8 full with all DIV v2 helpers
+ *   0 clear measurements and helper counters
+ *
+ * The guest always executes complete frames. FS2 skips only renderer and
+ * GEOS blit work. Helper counters are displayed as hits per second over the
+ * same two-second window as guest/blit FPS.
+ *
+ ***********************************************************************/
+
+@include <stdapp.goh>
+#include <graphics.h>
+#include <geode.h>
+#include <file.h>
+#include <timer.h>
+#include <input.h>
+
+#define ENABLE_SOUND 0
+#define ENABLE_LCD 1
+#define PEANUT_GB_12_COLOUR 0
+#define PEANUT_GB_HIGH_LCD_ACCURACY 0
+#define PEANUT_GB_USE_INTRINSICS 0
+#define PEANUT_GB_IS_LITTLE_ENDIAN 1
+#define PGB_DISABLE_RTC 1
+#define PGB_DISABLE_SERIAL 1
+
+#define GB_WIDTH                    160
+#define GB_HEIGHT                   144
+#define GB_4BPP_BYTES_PER_LINE       80
+#define GB_4BPP_FRAME_BYTES       11520
+#define GB_MONO_BYTES_PER_LINE       20
+#define GB_MONO_FRAME_BYTES        2880
+#define GB_MAX_STEPS_PER_FRAME    30000
+
+#define MODE_CORE_BASE                1
+#define MODE_CORE_V1                  2
+#define MODE_CORE_V2                  3
+#define MODE_FS2_BASE                 4
+#define MODE_FS2_V1                   5
+#define MODE_FS2_V2                   6
+#define MODE_FULL_BASE                7
+#define MODE_FULL_V1                  8
+#define MODE_FULL_V2                  9
+
+#define STAGE_UI_READY                0
+#define STAGE_ALLOC_4BPP              1
+#define STAGE_ALLOC_MONO              2
+#define STAGE_ALLOC_BANK0             3
+#define STAGE_ALLOC_BANK1             4
+#define STAGE_OPEN_FILE               5
+#define STAGE_READ_BANK0              6
+#define STAGE_READ_BANK1              7
+#define STAGE_VALIDATE_ROM            8
+#define STAGE_CALL_INIT               9
+#define STAGE_FIRST_FRAME            10
+#define STAGE_RUNNING                11
+#define STAGE_FAILED                100
+
+/*
+ * These variables must be declared before PGBLCD.H because the fast direct
+ * macros below are expanded inside the core.
+ */
+static byte *gbFastBank0 = NULL;
+static byte *gbFastBank1 = NULL;
+static Boolean gbRenderEnabled = TRUE;
+static Boolean gbPackEnabled = TRUE;
+static Boolean gbUseFastRenderer = FALSE;
+static Boolean gbUseRow8Renderer = FALSE;
+static byte gbDivLevel = 0;
+static Boolean gbDivSignatureValid = FALSE;
+static word gbDivFullPeriod = 0;
+static word gbDivPrefixPeriod = 0;
+static word gbDivFinalPeriod = 0;
+static word gbDivFallbackPeriod = 0;
+
+#define PGB_DIV_SUPER_ENABLED(gb) \
+    ((gbDivLevel != 0) && gbDivSignatureValid)
+
+#define PGB_DIV_SUPER_LEVEL(gb) \
+    (gbDivSignatureValid ? gbDivLevel : 0)
+
+#define PGB_DIV_FULL_HIT() \
+    (gbDivFullPeriod++)
+
+#define PGB_DIV_PREFIX_HIT() \
+    (gbDivPrefixPeriod++)
+
+#define PGB_DIV_FINAL_HIT() \
+    (gbDivFinalPeriod++)
+
+#define PGB_DIV_FALLBACK_HIT() \
+    (gbDivFallbackPeriod++)
+
+
+struct gb_s;
+
+static void GBCoreErrorDirect(struct gb_s *gb,
+                              const int error,
+                              const unsigned short address);
+static void GBLcdLine(struct gb_s *gb,
+                      const unsigned char *pixels,
+                      const unsigned char line);
+static void GBFastDrawLine(struct gb_s *gb);
+static void GBTableDrawLine(struct gb_s *gb);
+static void GBRow8DrawLine(struct gb_s *gb);
+
+static byte GBFetch8Slow(struct gb_s *gb);
+static byte GBPeek8Slow(struct gb_s *gb);
+static byte GBStackPop8Slow(struct gb_s *gb);
+static void GBStackPush8Slow(struct gb_s *gb,
+                             word address,
+                             byte value);
+static byte GBHighRead8Slow(struct gb_s *gb,
+                            byte offset);
+
+
+#define PGB_FETCH8(gb)                                               \
+    (((gb)->cpu_reg.pc.reg < 0x4000)                                \
+        ? gbFastBank0[(gb)->cpu_reg.pc.reg++]                        \
+        : GBFetch8Slow((gb)))
+
+#define PGB_PEEK8(gb)                                                \
+    (((gb)->cpu_reg.pc.reg < 0x4000)                                \
+        ? gbFastBank0[(gb)->cpu_reg.pc.reg]                          \
+        : GBPeek8Slow((gb)))
+
+#define PGB_STACK_POP8(gb)                                           \
+    ((((gb)->cpu_reg.sp.reg >= 0xC000) &&                           \
+      ((gb)->cpu_reg.sp.reg < 0xE000))                              \
+        ? (gb)->wram[(gb)->cpu_reg.sp.reg++ - 0xC000]               \
+        : GBStackPop8Slow((gb)))
+
+#define PGB_STACK_PUSH8(gb, value)                                   \
+    do {                                                             \
+        word pgbStackAddress;                                        \
+        byte pgbStackValue;                                          \
+        pgbStackValue = (byte)(value);                               \
+        pgbStackAddress = --(gb)->cpu_reg.sp.reg;                    \
+        if ((pgbStackAddress >= 0xC000) &&                           \
+            (pgbStackAddress < 0xE000)) {                            \
+            (gb)->wram[pgbStackAddress - 0xC000] = pgbStackValue;   \
+        } else {                                                     \
+            GBStackPush8Slow((gb),                                   \
+                             pgbStackAddress,                         \
+                             pgbStackValue);                          \
+        }                                                            \
+    } while (0)
+
+#define PGB_HIGH_READ8(gb, offset)                                   \
+    ((((byte)(offset) < 0x10) || ((byte)(offset) > 0x3F))           \
+        ? (gb)->hram_io[(byte)(offset)]                              \
+        : GBHighRead8Slow((gb), (byte)(offset)))
+
+/*
+ * Fast 32 KiB direct ROM access. FlappyBird.gb has two 16 KiB banks.
+ * This removes a C function call from every ROM fetch/read.
+ */
+#define PGB_ROM_READ(gb, addr)                                      \
+    (((unsigned long)(addr) < 0x4000UL)                             \
+        ? gbFastBank0[(word)(addr)]                                 \
+        : gbFastBank1[(word)((unsigned long)(addr) & 0x3FFFUL)])
+
+#define PGB_CART_RAM_READ(gb, addr) (0xFF)
+#define PGB_CART_RAM_WRITE(gb, addr, val) ((void)0)
+
+#define PGB_REPORT_ERROR(gb, error, addr)                            \
+    GBCoreErrorDirect((gb), (int)(error), (unsigned short)(addr))
+
+/*
+ * When MODE_CORE is active this becomes FALSE, so Peanut-GB returns from
+ * __gb_draw_line before tile/sprite rendering begins.
+ */
+#define PGB_LCD_AVAILABLE(gb) (gbRenderEnabled)
+
+#define PGB_LCD_DRAW_LINE(gb, pixels, line)                          \
+    GBLcdLine((gb), (pixels), (unsigned char)(line))
+
+#pragma option -v- -y-
+#include "PGBROW.H"
+#pragma option -v -y
+
+
+static byte
+GBFetch8Slow(struct gb_s *gb)
+{
+    word address;
+
+    address = gb->cpu_reg.pc.reg++;
+
+    if (address < 0x8000) {
+        return gbFastBank1[address & 0x3FFF];
+    }
+
+    return __gb_read(gb, address);
+}
+
+
+static byte
+GBPeek8Slow(struct gb_s *gb)
+{
+    word address;
+
+    address = gb->cpu_reg.pc.reg;
+
+    if (address < 0x8000) {
+        return gbFastBank1[address & 0x3FFF];
+    }
+
+    return __gb_read(gb, address);
+}
+
+
+static byte
+GBStackPop8Slow(struct gb_s *gb)
+{
+    word address;
+
+    address = gb->cpu_reg.sp.reg++;
+    return __gb_read(gb, address);
+}
+
+
+static void
+GBStackPush8Slow(struct gb_s *gb,
+                 word address,
+                 byte value)
+{
+    __gb_write(gb, address, value);
+}
+
+
+static byte
+GBHighRead8Slow(struct gb_s *gb,
+                byte offset)
+{
+    return __gb_read(gb,
+                     (word)(0xFF00 | offset));
+}
+
+
+
+@class GBRowProcessClass, GenProcessClass;
+    @message void MSG_GBROW_NEXT_STAGE();
+    @message void MSG_GBROW_WORK();
+    @message void MSG_GBROW_RESET();
+@endc;
+
+@classdecl GBRowProcessClass, neverSaved;
+
+
+typedef struct {
+    Bitmap header;
+    byte pixels[GB_4BPP_FRAME_BYTES];
+} GB4FrameBuffer;
+
+typedef struct {
+    Bitmap header;
+    byte pixels[GB_MONO_FRAME_BYTES];
+} GBMonoFrameBuffer;
+
+
+/***********************************************************************
+ * Runtime state.
+ ***********************************************************************/
+
+static struct gb_s gbCore;
+
+static const byte gbShadeMap[4] = {
+    C_WHITE,
+    C_RED,
+    C_GREEN,
+    C_BLACK
+};
+
+/*
+ * 4-pixel decoder:
+ *   input index = high nibble from tile plane 0, low nibble from plane 1
+ *   output word = four GEOS 4-bpp pixels (two bytes, little-endian)
+ */
+static word gbBgWordLUT[256];
+static byte gbBgMaskLUT[256];
+static byte gbLastBGP = 0xFF;
+
+/*
+ * Hardware-like first-ten sprite selection, prepared once at line zero.
+ * 144 scanlines x 10 sprite indices = 1440 bytes.
+ */
+static byte gbSpriteCount[GB_HEIGHT];
+static byte gbSpriteList[GB_HEIGHT * 10];
+
+static WindowHandle gbWindow = 0;
+static Boolean gbStarted = FALSE;
+static Boolean gbRunning = FALSE;
+static Boolean gbWorkQueued = FALSE;
+
+static word gbStage = STAGE_UI_READY;
+static word gbFailureCode = 0;
+static enum gb_init_error_e gbInitResult = GB_INIT_INVALID_MAX;
+
+static word gbMode = MODE_CORE_BASE;
+static byte gbSkipPhase = 0;
+static word gbCoreErrors = 0;
+static word gbLinesDrawn = 0;
+static word gbSteps = 0;
+
+static word gbMeasuredGuestFPS = 0;
+static word gbMeasuredBlitFPS = 0;
+static word gbMeasuredDivFull = 0;
+static word gbMeasuredDivPrefix = 0;
+static word gbMeasuredDivFinal = 0;
+static word gbMeasuredDivFallback = 0;
+static word gbGuestFramesInPeriod = 0;
+static word gbBlitsInPeriod = 0;
+static dword gbPeriodStart = 0;
+
+static MemHandle gb4Handle = 0;
+static GB4FrameBuffer *gb4Frame = NULL;
+
+static MemHandle gbMonoHandle = 0;
+static GBMonoFrameBuffer *gbMonoFrame = NULL;
+
+static MemHandle gbBank0Handle = 0;
+static MemHandle gbBank1Handle = 0;
+
+static FileHandle gbRomFile = 0;
+static Boolean gbDirPushed = FALSE;
+
+
+/***********************************************************************
+ * Application objects.
+ ***********************************************************************/
+
+@start AppResource;
+
+@object GenApplicationClass GBRowApp = {
+    GI_visMoniker = list {
+        @GBRowTextMoniker
+    }
+    GI_comp = @GBRowPrimary;
+    gcnList(MANUFACTURER_ID_GEOWORKS, GAGCNLT_WINDOWS) = @GBRowPrimary;
+}
+
+@visMoniker GBRowTextMoniker = "GB DIV2 Bench v1.6";
+
+@end AppResource;
+
+
+@start Interface;
+
+@object GenPrimaryClass GBRowPrimary = {
+    GI_comp = @GBRowView;
+    ATTR_GEN_DISPLAY_NOT_MINIMIZABLE;
+}
+
+@object GenViewClass GBRowView = {
+    GVI_content = process;
+
+    GVI_docBounds = {
+        0, 0,
+        560, 200
+    };
+
+    GVI_horizAttrs = @default | GVDA_NO_LARGER_THAN_CONTENT;
+    GVI_vertAttrs  = @default | GVDA_NO_LARGER_THAN_CONTENT;
+}
+
+@end Interface;
+
+
+/***********************************************************************
+ * Helpers.
+ ***********************************************************************/
+
+static void
+GBZeroBytes(byte *buffer, word count)
+{
+    while (count != 0) {
+        *buffer++ = 0;
+        count--;
+    }
+}
+
+
+static void
+GBWordToText(word value, char *buffer)
+{
+    char reverse[6];
+    word count;
+    word index;
+
+    if (value == 0) {
+        buffer[0] = '0';
+        buffer[1] = '\0';
+        return;
+    }
+
+    count = 0;
+
+    while ((value != 0) && (count < 5)) {
+        reverse[count] = (char)('0' + (value % 10));
+        value /= 10;
+        count++;
+    }
+
+    for (index = 0; index < count; index++) {
+        buffer[index] = reverse[count - index - 1];
+    }
+
+    buffer[count] = '\0';
+}
+
+
+static void
+GBDwordToText(dword value, char *buffer)
+{
+    char reverse[11];
+    word count;
+    word index;
+
+    if (value == 0) {
+        buffer[0] = '0';
+        buffer[1] = '\0';
+        return;
+    }
+
+    count = 0;
+
+    while ((value != 0) && (count < 10)) {
+        reverse[count] = (char)('0' + (value % 10L));
+        value /= 10L;
+        count++;
+    }
+
+    for (index = 0; index < count; index++) {
+        buffer[index] = reverse[count - index - 1];
+    }
+
+    buffer[count] = '\0';
+}
+
+
+static const char *
+GBBuildText(void)
+{
+#ifdef DO_ERROR_CHECKING
+    return "EC";
+#else
+    return "NC";
+#endif
+}
+
+
+static const char *
+GBModeText(void)
+{
+    switch (gbMode) {
+    case MODE_CORE_BASE:
+        return "1 CORE OFF";
+    case MODE_CORE_V1:
+        return "2 CORE V1";
+    case MODE_CORE_V2:
+        return "3 CORE V2";
+    case MODE_FS2_BASE:
+        return "4 FS2 OFF";
+    case MODE_FS2_V1:
+        return "5 FS2 V1";
+    case MODE_FS2_V2:
+        return "6 FS2 V2";
+    case MODE_FULL_BASE:
+        return "7 FULL OFF";
+    case MODE_FULL_V1:
+        return "8 FULL V1";
+    case MODE_FULL_V2:
+        return "9 FULL V2";
+    }
+
+    return "?";
+}
+
+
+static const char *
+GBStageText(void)
+{
+    switch (gbStage) {
+    case STAGE_UI_READY:
+        return "UI READY";
+    case STAGE_ALLOC_4BPP:
+        return "ALLOC 4BPP";
+    case STAGE_ALLOC_MONO:
+        return "ALLOC MONO";
+    case STAGE_ALLOC_BANK0:
+        return "ALLOC BANK 0";
+    case STAGE_ALLOC_BANK1:
+        return "ALLOC BANK 1";
+    case STAGE_OPEN_FILE:
+        return "OPEN FLAPPY.GB";
+    case STAGE_READ_BANK0:
+        return "READ BANK 0";
+    case STAGE_READ_BANK1:
+        return "READ BANK 1";
+    case STAGE_VALIDATE_ROM:
+        return "VALIDATE ROM";
+    case STAGE_CALL_INIT:
+        return "CALL GB_INIT";
+    case STAGE_FIRST_FRAME:
+        return "FIRST FRAME";
+    case STAGE_RUNNING:
+        return "RUNNING";
+    case STAGE_FAILED:
+        return "FAILED";
+    }
+
+    return "UNKNOWN";
+}
+
+
+/***********************************************************************
+ * Buffer initialization.
+ ***********************************************************************/
+
+static void
+GBInit4Buffer(void)
+{
+    if (gb4Frame == NULL) {
+        return;
+    }
+
+    gb4Frame->header.B_width = GB_WIDTH;
+    gb4Frame->header.B_height = GB_HEIGHT;
+    gb4Frame->header.B_compact = BMC_UNCOMPACTED;
+    gb4Frame->header.B_type = BMF_4BIT;
+
+    GBZeroBytes(gb4Frame->pixels, GB_4BPP_FRAME_BYTES);
+}
+
+
+static void
+GBInitMonoBuffer(void)
+{
+    word y;
+    word x;
+    word rowBase;
+
+    if (gbMonoFrame == NULL) {
+        return;
+    }
+
+    gbMonoFrame->header.B_width = GB_WIDTH;
+    gbMonoFrame->header.B_height = GB_HEIGHT;
+    gbMonoFrame->header.B_compact = BMC_UNCOMPACTED;
+    gbMonoFrame->header.B_type = BMF_MONO;
+
+    /*
+     * Static checker pattern. Polarity is irrelevant to the throughput test.
+     */
+    for (y = 0; y < GB_HEIGHT; y++) {
+        rowBase = (word)(y * GB_MONO_BYTES_PER_LINE);
+
+        for (x = 0; x < GB_MONO_BYTES_PER_LINE; x++) {
+            gbMonoFrame->pixels[rowBase + x] =
+                (byte)(((x + y) & 1) ? 0xAA : 0x55);
+        }
+    }
+}
+
+
+/***********************************************************************
+ * Resource lifecycle.
+ ***********************************************************************/
+
+static void
+GBCloseFileAndPath(void)
+{
+    if (gbRomFile != 0) {
+        FileClose(gbRomFile, FALSE);
+        gbRomFile = 0;
+    }
+
+    if (gbDirPushed) {
+        FilePopDir();
+        gbDirPushed = FALSE;
+    }
+}
+
+
+static void
+GBFreeMemory(void)
+{
+    if (gbBank1Handle != 0) {
+        if (gbFastBank1 != NULL) {
+            MemUnlock(gbBank1Handle);
+        }
+
+        gbFastBank1 = NULL;
+        MemFree(gbBank1Handle);
+        gbBank1Handle = 0;
+    }
+
+    if (gbBank0Handle != 0) {
+        if (gbFastBank0 != NULL) {
+            MemUnlock(gbBank0Handle);
+        }
+
+        gbFastBank0 = NULL;
+        MemFree(gbBank0Handle);
+        gbBank0Handle = 0;
+    }
+
+    if (gbMonoHandle != 0) {
+        if (gbMonoFrame != NULL) {
+            MemUnlock(gbMonoHandle);
+        }
+
+        gbMonoFrame = NULL;
+        MemFree(gbMonoHandle);
+        gbMonoHandle = 0;
+    }
+
+    if (gb4Handle != 0) {
+        if (gb4Frame != NULL) {
+            MemUnlock(gb4Handle);
+        }
+
+        gb4Frame = NULL;
+        MemFree(gb4Handle);
+        gb4Handle = 0;
+    }
+}
+
+
+static void
+GBFail(word code)
+{
+    gbFailureCode = code;
+    gbStage = STAGE_FAILED;
+    gbRunning = FALSE;
+    gbWorkQueued = FALSE;
+
+    GBCloseFileAndPath();
+}
+
+
+/***********************************************************************
+ * Peanut-GB hooks.
+ ***********************************************************************/
+
+static void
+GBCoreErrorDirect(struct gb_s *gb,
+                  const int error,
+                  const unsigned short address)
+{
+    (void)gb;
+    (void)error;
+    (void)address;
+
+    gbCoreErrors++;
+}
+
+
+static void
+GBLcdLine(struct gb_s *gb,
+          const unsigned char *pixels,
+          const unsigned char line)
+{
+    word x;
+    word rowBase;
+    byte left;
+    byte right;
+
+    (void)gb;
+
+    if ((!gbPackEnabled) ||
+        (gb4Frame == NULL) ||
+        (line >= GB_HEIGHT)) {
+
+        return;
+    }
+
+    rowBase = (word)((word)line * GB_4BPP_BYTES_PER_LINE);
+
+    for (x = 0; x < GB_WIDTH; x += 2) {
+        left = gbShadeMap[pixels[x] & LCD_COLOUR];
+        right = gbShadeMap[pixels[x + 1] & LCD_COLOUR];
+
+        gb4Frame->pixels[rowBase + (x >> 1)] =
+            (byte)((left << 4) | right);
+    }
+
+    gbLinesDrawn++;
+}
+
+
+
+/***********************************************************************
+ * Direct packed 4-bpp renderer.
+ *
+ * Differences from the stock Peanut renderer:
+ *   - no temporary pixels[160] scanline;
+ *   - no automatic 160-byte zero fill on every line;
+ *   - background pixels are produced two at a time directly into GEOS
+ *     4-bpp bytes;
+ *   - sprites update the destination nibble in place;
+ *   - a 20-byte bit mask preserves OBJ-behind-BG priority.
+ *
+ * It is intentionally conservative: window and sprite behaviour remain
+ * compatible with the low-accuracy stock renderer used by this port.
+ ***********************************************************************/
+
+static void
+GBBuildBackgroundLUT(struct gb_s *gb)
+{
+    word index;
+    byte plane0;
+    byte plane1;
+    byte colour0;
+    byte colour1;
+    byte colour2;
+    byte colour3;
+    byte shade0;
+    byte shade1;
+    byte shade2;
+    byte shade3;
+    byte firstByte;
+    byte secondByte;
+    byte mask;
+
+    for (index = 0; index < 256; index++) {
+        plane0 = (byte)(index >> 4);
+        plane1 = (byte)(index & 0x0F);
+
+        colour0 =
+            (byte)(((plane0 >> 3) & 1)
+            | (((plane1 >> 3) & 1) << 1));
+
+        colour1 =
+            (byte)(((plane0 >> 2) & 1)
+            | (((plane1 >> 2) & 1) << 1));
+
+        colour2 =
+            (byte)(((plane0 >> 1) & 1)
+            | (((plane1 >> 1) & 1) << 1));
+
+        colour3 =
+            (byte)((plane0 & 1)
+            | ((plane1 & 1) << 1));
+
+        shade0 =
+            gbShadeMap[gb->display.bg_palette[colour0] & LCD_COLOUR];
+        shade1 =
+            gbShadeMap[gb->display.bg_palette[colour1] & LCD_COLOUR];
+        shade2 =
+            gbShadeMap[gb->display.bg_palette[colour2] & LCD_COLOUR];
+        shade3 =
+            gbShadeMap[gb->display.bg_palette[colour3] & LCD_COLOUR];
+
+        firstByte = (byte)((shade0 << 4) | shade1);
+        secondByte = (byte)((shade2 << 4) | shade3);
+
+        /*
+         * The 486 is little-endian: low byte is written first.
+         */
+        gbBgWordLUT[index] =
+            (word)((word)firstByte | ((word)secondByte << 8));
+
+        mask = 0;
+
+        if (colour0 != 0) {
+            mask |= 0x08;
+        }
+        if (colour1 != 0) {
+            mask |= 0x04;
+        }
+        if (colour2 != 0) {
+            mask |= 0x02;
+        }
+        if (colour3 != 0) {
+            mask |= 0x01;
+        }
+
+        gbBgMaskLUT[index] = mask;
+    }
+
+    gbLastBGP = gb->hram_io[IO_BGP];
+}
+
+
+static void
+GBBuildSpriteLists(struct gb_s *gb)
+{
+    word y;
+    word slot;
+    word height;
+    int sprite;
+    int top;
+    int bottom;
+    int line;
+    byte oy;
+    byte ox;
+
+    for (y = 0; y < GB_HEIGHT; y++) {
+        gbSpriteCount[y] = 0;
+    }
+
+    height =
+        (gb->hram_io[IO_LCDC] & LCDC_OBJ_SIZE) ? 16 : 8;
+
+    /*
+     * Scan OAM from low to high and retain the first ten sprites for each
+     * line, which matches the Game Boy's line-selection limit.
+     */
+    for (sprite = 0; sprite < NUM_SPRITES; sprite++) {
+        oy = gb->oam[4 * sprite + 0];
+        ox = gb->oam[4 * sprite + 1];
+
+        if ((ox == 0) || (ox >= 168)) {
+            continue;
+        }
+
+        top = (int)oy - 16;
+        bottom = top + (int)height;
+
+        if ((bottom <= 0) || (top >= GB_HEIGHT)) {
+            continue;
+        }
+
+        if (top < 0) {
+            top = 0;
+        }
+
+        if (bottom > GB_HEIGHT) {
+            bottom = GB_HEIGHT;
+        }
+
+        for (line = top; line < bottom; line++) {
+            slot = gbSpriteCount[line];
+
+            if (slot < 10) {
+                gbSpriteList[(word)line * 10 + slot] =
+                    (byte)sprite;
+                gbSpriteCount[line] = (byte)(slot + 1);
+            }
+        }
+    }
+}
+
+
+static void
+GBTableDrawLine(struct gb_s *gb)
+{
+    byte bgMask[20];
+    byte *row;
+    word *rowWords;
+    byte ly;
+    byte lcdc;
+    byte bgY;
+    byte scx;
+    byte bgX;
+    byte offset;
+    byte available;
+    byte needed;
+    byte plane0;
+    byte plane1;
+    byte next0;
+    byte next1;
+    byte lowMask;
+    byte index;
+    byte mask4;
+    byte idx;
+    byte py;
+    byte bit;
+    byte colour;
+    byte shade;
+    byte maskByte;
+    byte oy;
+    byte ox;
+    byte ot;
+    byte of;
+    byte t1;
+    byte t2;
+    byte sourceBit;
+    byte spriteCount;
+    byte spriteNumber;
+    word bgMap;
+    word winMap;
+    word tile;
+    word nextTile;
+    word rowBase;
+    word x;
+    word i;
+    word startX;
+    word winX;
+    int listPos;
+    int sx;
+
+    if ((!gbRenderEnabled) || (gb4Frame == NULL)) {
+        return;
+    }
+
+    if (gb->direct.frame_skip && !gb->display.frame_skip_count) {
+        return;
+    }
+
+    ly = gb->hram_io[IO_LY];
+
+    if (ly >= GB_HEIGHT) {
+        return;
+    }
+
+    lcdc = gb->hram_io[IO_LCDC];
+
+    if (gbLastBGP != gb->hram_io[IO_BGP]) {
+        GBBuildBackgroundLUT(gb);
+    }
+
+    if (ly == 0) {
+        GBBuildSpriteLists(gb);
+    }
+
+    rowBase = (word)((word)ly * GB_4BPP_BYTES_PER_LINE);
+    row = &gb4Frame->pixels[rowBase];
+    rowWords = (word *)row;
+
+    for (i = 0; i < 20; i++) {
+        bgMask[i] = 0;
+    }
+
+    /*
+     * Background in 40 groups of four pixels.
+     */
+    if (lcdc & LCDC_BG_ENABLE) {
+        bgY = (byte)(ly + gb->hram_io[IO_SCY]);
+        scx = gb->hram_io[IO_SCX];
+
+        bgMap =
+            ((lcdc & LCDC_BG_MAP) ? VRAM_BMAP_2 : VRAM_BMAP_1)
+            + ((word)(bgY >> 3) * 0x20);
+
+        for (x = 0; x < GB_WIDTH; x += 4) {
+            bgX = (byte)(x + scx);
+            offset = (byte)(bgX & 7);
+
+            idx = gb->vram[bgMap + (bgX >> 3)];
+
+            if (lcdc & LCDC_TILE_SELECT) {
+                tile = VRAM_TILES_1 + ((word)idx << 4);
+            } else {
+                tile = VRAM_TILES_2
+                     + ((word)((byte)(idx + 0x80)) << 4);
+            }
+
+            tile += (word)((bgY & 7) << 1);
+            t1 = gb->vram[tile];
+            t2 = gb->vram[tile + 1];
+
+            if (offset <= 4) {
+                plane0 =
+                    (byte)((t1 >> (4 - offset)) & 0x0F);
+                plane1 =
+                    (byte)((t2 >> (4 - offset)) & 0x0F);
+            } else {
+                available = (byte)(8 - offset);
+                needed = (byte)(4 - available);
+                lowMask = (byte)((1 << available) - 1);
+
+                idx =
+                    gb->vram[bgMap
+                    + (((byte)(bgX + available)) >> 3)];
+
+                if (lcdc & LCDC_TILE_SELECT) {
+                    nextTile =
+                        VRAM_TILES_1 + ((word)idx << 4);
+                } else {
+                    nextTile =
+                        VRAM_TILES_2
+                        + ((word)((byte)(idx + 0x80)) << 4);
+                }
+
+                nextTile += (word)((bgY & 7) << 1);
+                next0 = gb->vram[nextTile];
+                next1 = gb->vram[nextTile + 1];
+
+                plane0 =
+                    (byte)(((t1 & lowMask) << needed)
+                    | (next0 >> (8 - needed)));
+
+                plane1 =
+                    (byte)(((t2 & lowMask) << needed)
+                    | (next1 >> (8 - needed)));
+            }
+
+            index = (byte)((plane0 << 4) | plane1);
+            rowWords[x >> 2] = gbBgWordLUT[index];
+
+            mask4 = gbBgMaskLUT[index];
+
+            if (x & 4) {
+                bgMask[x >> 3] |= mask4;
+            } else {
+                bgMask[x >> 3] = (byte)(mask4 << 4);
+            }
+        }
+    } else {
+        shade =
+            gbShadeMap[gb->display.bg_palette[0] & LCD_COLOUR];
+        index = (byte)((shade << 4) | shade);
+
+        for (i = 0; i < GB_4BPP_BYTES_PER_LINE; i++) {
+            row[i] = index;
+        }
+    }
+
+    /*
+     * Window remains a conservative pixel path. Most gameplay frames in the
+     * test ROM do not use it, while this preserves correctness for menus.
+     */
+    if ((lcdc & LCDC_WINDOW_ENABLE) &&
+        (ly >= gb->display.WY) &&
+        (gb->hram_io[IO_WX] <= 166)) {
+
+        startX =
+            (gb->hram_io[IO_WX] < 7)
+                ? 0
+                : (word)(gb->hram_io[IO_WX] - 7);
+
+        winMap =
+            (lcdc & LCDC_WINDOW_MAP) ? VRAM_BMAP_2 : VRAM_BMAP_1;
+
+        winMap +=
+            (word)((gb->display.window_clear >> 3) * 0x20);
+
+        py = (byte)(gb->display.window_clear & 7);
+
+        for (x = startX; x < GB_WIDTH; x++) {
+            winX = x - startX;
+            idx = gb->vram[winMap + (winX >> 3)];
+
+            if (lcdc & LCDC_TILE_SELECT) {
+                tile = VRAM_TILES_1 + ((word)idx << 4);
+            } else {
+                tile = VRAM_TILES_2
+                     + ((word)((byte)(idx + 0x80)) << 4);
+            }
+
+            tile += (word)(py << 1);
+            bit = (byte)(7 - (winX & 7));
+
+            colour =
+                (byte)(((gb->vram[tile] >> bit) & 1)
+                | (((gb->vram[tile + 1] >> bit) & 1) << 1));
+
+            shade =
+                gbShadeMap[
+                    gb->display.bg_palette[colour] & LCD_COLOUR
+                ];
+
+            if (x & 1) {
+                row[x >> 1] =
+                    (byte)((row[x >> 1] & 0xF0) | shade);
+            } else {
+                row[x >> 1] =
+                    (byte)((row[x >> 1] & 0x0F) | (shade << 4));
+            }
+
+            maskByte = (byte)(0x80 >> (x & 7));
+
+            if (colour != 0) {
+                bgMask[x >> 3] |= maskByte;
+            } else {
+                bgMask[x >> 3] &= (byte)(~maskByte);
+            }
+        }
+
+        gb->display.window_clear++;
+    }
+
+    /*
+     * Only the preselected sprites touching this scanline are visited.
+     */
+    if (lcdc & LCDC_OBJ_ENABLE) {
+        spriteCount = gbSpriteCount[ly];
+
+        for (listPos = (int)spriteCount - 1;
+             listPos >= 0;
+             listPos--) {
+
+            spriteNumber =
+                gbSpriteList[(word)ly * 10 + (word)listPos];
+
+            oy = gb->oam[4 * spriteNumber + 0];
+            ox = gb->oam[4 * spriteNumber + 1];
+            ot = (byte)(gb->oam[4 * spriteNumber + 2]
+                 & ((lcdc & LCDC_OBJ_SIZE) ? 0xFE : 0xFF));
+            of = gb->oam[4 * spriteNumber + 3];
+
+            py = (byte)(ly - oy + 16);
+
+            if (of & OBJ_FLIP_Y) {
+                py =
+                    (byte)(((lcdc & LCDC_OBJ_SIZE) ? 15 : 7) - py);
+            }
+
+            tile =
+                VRAM_TILES_1
+                + ((word)ot << 4)
+                + ((word)py << 1);
+
+            t1 = gb->vram[tile];
+            t2 = gb->vram[tile + 1];
+
+            for (i = 0; i < 8; i++) {
+                sx = (int)ox - 8 + (int)i;
+
+                if ((sx < 0) || (sx >= GB_WIDTH)) {
+                    continue;
+                }
+
+                sourceBit =
+                    (of & OBJ_FLIP_X)
+                        ? (byte)i
+                        : (byte)(7 - i);
+
+                colour =
+                    (byte)(((t1 >> sourceBit) & 1)
+                    | (((t2 >> sourceBit) & 1) << 1));
+
+                if (colour == 0) {
+                    continue;
+                }
+
+                maskByte = (byte)(0x80 >> (sx & 7));
+
+                if ((of & OBJ_PRIORITY) &&
+                    (bgMask[(word)sx >> 3] & maskByte)) {
+
+                    continue;
+                }
+
+                if (of & OBJ_PALETTE) {
+                    shade =
+                        gbShadeMap[
+                            gb->display.sp_palette[colour + 4]
+                            & LCD_COLOUR
+                        ];
+                } else {
+                    shade =
+                        gbShadeMap[
+                            gb->display.sp_palette[colour]
+                            & LCD_COLOUR
+                        ];
+                }
+
+                if (sx & 1) {
+                    row[(word)sx >> 1] =
+                        (byte)((row[(word)sx >> 1] & 0xF0)
+                               | shade);
+                } else {
+                    row[(word)sx >> 1] =
+                        (byte)((row[(word)sx >> 1] & 0x0F)
+                               | (shade << 4));
+                }
+            }
+        }
+    }
+
+    gbLinesDrawn++;
+}
+
+
+
+/*
+ * Load one background tile row from the current map column.
+ * The caller supplies all temporaries so the macro stays in the hot loop.
+ */
+#define GB_ROW8_LOAD_TILE_ROW(column, outPlane0, outPlane1)           \
+    do {                                                              \
+        idx = mapRow[(column)];                                       \
+        tile = tileDataBase                                           \
+             + ((word)((byte)(idx ^ tileIndexXor)) << 4)             \
+             + tileRowOffset;                                         \
+        (outPlane0) = vram[tile];                                    \
+        (outPlane1) = vram[tile + 1];                                \
+    } while (0)
+
+/*
+ * Eight-pixel scanline loop specialized by a compile-time scroll offset.
+ * Twenty iterations produce the complete 160-pixel background.
+ */
+#define GB_ROW8_RENDER_SHIFT(shiftValue)                              \
+    do {                                                              \
+        mapColumn = (byte)(scx >> 3);                                \
+        outWords = rowWords;                                          \
+        maskOut = bgMask;                                             \
+        GB_ROW8_LOAD_TILE_ROW(mapColumn, t1, t2);                     \
+        for (i = 0; i < 20; i++) {                                   \
+            mapColumn = (byte)((mapColumn + 1) & 31);                \
+            GB_ROW8_LOAD_TILE_ROW(mapColumn, next0, next1);           \
+            plane0 = (byte)(((word)t1 << (shiftValue))               \
+                     | ((word)next0 >> (8 - (shiftValue))));         \
+            plane1 = (byte)(((word)t2 << (shiftValue))               \
+                     | ((word)next1 >> (8 - (shiftValue))));         \
+            index = (byte)((plane0 & 0xF0) | (plane1 >> 4));         \
+            *outWords++ = gbBgWordLUT[index];                         \
+            maskHigh = (byte)(gbBgMaskLUT[index] << 4);              \
+            index = (byte)((plane0 << 4) | (plane1 & 0x0F));         \
+            *outWords++ = gbBgWordLUT[index];                         \
+            *maskOut++ = (byte)(maskHigh | gbBgMaskLUT[index]);      \
+            t1 = next0;                                               \
+            t2 = next1;                                               \
+        }                                                             \
+    } while (0)
+
+
+static void
+GBRow8DrawLine(struct gb_s *gb)
+{
+    byte bgMask[20];
+    byte *row;
+    byte *vram;
+    byte *mapRow;
+    byte *maskOut;
+    word *rowWords;
+    word *outWords;
+    byte ly;
+    byte lcdc;
+    byte bgY;
+    byte scx;
+    byte offset;
+    byte plane0;
+    byte plane1;
+    byte next0;
+    byte next1;
+    byte index;
+    byte maskHigh;
+    byte idx;
+    byte mapColumn;
+    byte tileIndexXor;
+    byte py;
+    byte bit;
+    byte colour;
+    byte shade;
+    byte maskByte;
+    byte oy;
+    byte ox;
+    byte ot;
+    byte of;
+    byte t1;
+    byte t2;
+    byte sourceBit;
+    byte spriteCount;
+    byte spriteNumber;
+    word bgMap;
+    word winMap;
+    word tile;
+    word tileDataBase;
+    word tileRowOffset;
+    word rowBase;
+    word x;
+    word i;
+    word startX;
+    word winX;
+    int listPos;
+    int sx;
+
+    if ((!gbRenderEnabled) || (gb4Frame == NULL)) {
+        return;
+    }
+
+    if (gb->direct.frame_skip && !gb->display.frame_skip_count) {
+        return;
+    }
+
+    ly = gb->hram_io[IO_LY];
+
+    if (ly >= GB_HEIGHT) {
+        return;
+    }
+
+    lcdc = gb->hram_io[IO_LCDC];
+
+    if (gbLastBGP != gb->hram_io[IO_BGP]) {
+        GBBuildBackgroundLUT(gb);
+    }
+
+    if (ly == 0) {
+        GBBuildSpriteLists(gb);
+    }
+
+    rowBase = (word)((word)ly * GB_4BPP_BYTES_PER_LINE);
+    row = &gb4Frame->pixels[rowBase];
+    rowWords = (word *)row;
+    vram = gb->vram;
+
+    /*
+     * Background in twenty groups of eight pixels.
+     *
+     * SCX & 7 is constant for the whole scanline. Select one expanded loop
+     * before entering the hot path. Each iteration loads only the next tile
+     * row, reuses the previous row and writes all eight pixels as two words.
+     */
+    if (lcdc & LCDC_BG_ENABLE) {
+        bgY = (byte)(ly + gb->hram_io[IO_SCY]);
+        scx = gb->hram_io[IO_SCX];
+        offset = (byte)(scx & 7);
+        tileRowOffset = (word)((bgY & 7) << 1);
+
+        bgMap =
+            ((lcdc & LCDC_BG_MAP) ? VRAM_BMAP_2 : VRAM_BMAP_1)
+            + ((word)(bgY >> 3) * 0x20);
+
+        mapRow = &vram[bgMap];
+
+        if (lcdc & LCDC_TILE_SELECT) {
+            tileDataBase = VRAM_TILES_1;
+            tileIndexXor = 0;
+        } else {
+            tileDataBase = VRAM_TILES_2;
+            tileIndexXor = 0x80;
+        }
+
+        switch (offset) {
+        case 0:
+            GB_ROW8_RENDER_SHIFT(0);
+            break;
+        case 1:
+            GB_ROW8_RENDER_SHIFT(1);
+            break;
+        case 2:
+            GB_ROW8_RENDER_SHIFT(2);
+            break;
+        case 3:
+            GB_ROW8_RENDER_SHIFT(3);
+            break;
+        case 4:
+            GB_ROW8_RENDER_SHIFT(4);
+            break;
+        case 5:
+            GB_ROW8_RENDER_SHIFT(5);
+            break;
+        case 6:
+            GB_ROW8_RENDER_SHIFT(6);
+            break;
+        default:
+            GB_ROW8_RENDER_SHIFT(7);
+            break;
+        }
+    } else {
+        shade =
+            gbShadeMap[gb->display.bg_palette[0] & LCD_COLOUR];
+        index = (byte)((shade << 4) | shade);
+
+        for (i = 0; i < GB_4BPP_BYTES_PER_LINE; i++) {
+            row[i] = index;
+        }
+
+        for (i = 0; i < 20; i++) {
+            bgMask[i] = 0;
+        }
+    }
+
+    /*
+     * Window remains a conservative pixel path. Most gameplay frames in the
+     * test ROM do not use it, while this preserves correctness for menus.
+     */
+    if ((lcdc & LCDC_WINDOW_ENABLE) &&
+        (ly >= gb->display.WY) &&
+        (gb->hram_io[IO_WX] <= 166)) {
+
+        startX =
+            (gb->hram_io[IO_WX] < 7)
+                ? 0
+                : (word)(gb->hram_io[IO_WX] - 7);
+
+        winMap =
+            (lcdc & LCDC_WINDOW_MAP) ? VRAM_BMAP_2 : VRAM_BMAP_1;
+
+        winMap +=
+            (word)((gb->display.window_clear >> 3) * 0x20);
+
+        py = (byte)(gb->display.window_clear & 7);
+
+        for (x = startX; x < GB_WIDTH; x++) {
+            winX = x - startX;
+            idx = vram[winMap + (winX >> 3)];
+
+            if (lcdc & LCDC_TILE_SELECT) {
+                tile = VRAM_TILES_1 + ((word)idx << 4);
+            } else {
+                tile = VRAM_TILES_2
+                     + ((word)((byte)(idx + 0x80)) << 4);
+            }
+
+            tile += (word)(py << 1);
+            bit = (byte)(7 - (winX & 7));
+
+            colour =
+                (byte)(((vram[tile] >> bit) & 1)
+                | (((vram[tile + 1] >> bit) & 1) << 1));
+
+            shade =
+                gbShadeMap[
+                    gb->display.bg_palette[colour] & LCD_COLOUR
+                ];
+
+            if (x & 1) {
+                row[x >> 1] =
+                    (byte)((row[x >> 1] & 0xF0) | shade);
+            } else {
+                row[x >> 1] =
+                    (byte)((row[x >> 1] & 0x0F) | (shade << 4));
+            }
+
+            maskByte = (byte)(0x80 >> (x & 7));
+
+            if (colour != 0) {
+                bgMask[x >> 3] |= maskByte;
+            } else {
+                bgMask[x >> 3] &= (byte)(~maskByte);
+            }
+        }
+
+        gb->display.window_clear++;
+    }
+
+    /*
+     * Only the preselected sprites touching this scanline are visited.
+     */
+    if (lcdc & LCDC_OBJ_ENABLE) {
+        spriteCount = gbSpriteCount[ly];
+
+        for (listPos = (int)spriteCount - 1;
+             listPos >= 0;
+             listPos--) {
+
+            spriteNumber =
+                gbSpriteList[(word)ly * 10 + (word)listPos];
+
+            oy = gb->oam[4 * spriteNumber + 0];
+            ox = gb->oam[4 * spriteNumber + 1];
+            ot = (byte)(gb->oam[4 * spriteNumber + 2]
+                 & ((lcdc & LCDC_OBJ_SIZE) ? 0xFE : 0xFF));
+            of = gb->oam[4 * spriteNumber + 3];
+
+            py = (byte)(ly - oy + 16);
+
+            if (of & OBJ_FLIP_Y) {
+                py =
+                    (byte)(((lcdc & LCDC_OBJ_SIZE) ? 15 : 7) - py);
+            }
+
+            tile =
+                VRAM_TILES_1
+                + ((word)ot << 4)
+                + ((word)py << 1);
+
+            t1 = vram[tile];
+            t2 = vram[tile + 1];
+
+            for (i = 0; i < 8; i++) {
+                sx = (int)ox - 8 + (int)i;
+
+                if ((sx < 0) || (sx >= GB_WIDTH)) {
+                    continue;
+                }
+
+                sourceBit =
+                    (of & OBJ_FLIP_X)
+                        ? (byte)i
+                        : (byte)(7 - i);
+
+                colour =
+                    (byte)(((t1 >> sourceBit) & 1)
+                    | (((t2 >> sourceBit) & 1) << 1));
+
+                if (colour == 0) {
+                    continue;
+                }
+
+                maskByte = (byte)(0x80 >> (sx & 7));
+
+                if ((of & OBJ_PRIORITY) &&
+                    (bgMask[(word)sx >> 3] & maskByte)) {
+
+                    continue;
+                }
+
+                if (of & OBJ_PALETTE) {
+                    shade =
+                        gbShadeMap[
+                            gb->display.sp_palette[colour + 4]
+                            & LCD_COLOUR
+                        ];
+                } else {
+                    shade =
+                        gbShadeMap[
+                            gb->display.sp_palette[colour]
+                            & LCD_COLOUR
+                        ];
+                }
+
+                if (sx & 1) {
+                    row[(word)sx >> 1] =
+                        (byte)((row[(word)sx >> 1] & 0xF0)
+                               | shade);
+                } else {
+                    row[(word)sx >> 1] =
+                        (byte)((row[(word)sx >> 1] & 0x0F)
+                               | (shade << 4));
+                }
+            }
+        }
+    }
+
+    gbLinesDrawn++;
+}
+
+
+static void
+GBFastDrawLine(struct gb_s *gb)
+{
+    if (gbUseRow8Renderer) {
+        GBRow8DrawLine(gb);
+    } else {
+        GBTableDrawLine(gb);
+    }
+}
+
+
+#undef GB_ROW8_RENDER_SHIFT
+#undef GB_ROW8_LOAD_TILE_ROW
+
+
+
+static Boolean
+GBValidateDivSignature(void)
+{
+    static const byte expected[36] = {
+        0xF5, 0xCB, 0x15, 0xCB, 0x14, 0xCB, 0x11, 0xCB, 0x10, 0xC5, 0x79, 0x9B, 0x4F, 0x78, 0x9A, 0x47, 0x3F, 0x38, 0x08, 0xC1, 0xF1, 0x3D, 0xB7, 0x20, 0xE7, 0x18, 0x09, 0x33, 0x33, 0xF1, 0x3D, 0x37, 0x20, 0xDE, 0x18, 0x00
+    };
+    word index;
+
+    if (gbFastBank0 == NULL) {
+        return FALSE;
+    }
+
+    for (index = 0; index < 36; index++) {
+        if (gbFastBank0[0x23CE + index] != expected[index]) {
+            return FALSE;
+        }
+    }
+
+    return TRUE;
+}
+
+
+/***********************************************************************
+ * Guest execution and measurement.
+ ***********************************************************************/
+
+static Boolean
+GBRunOneFrameSafe(void)
+{
+    gbCore.gb_frame = 0;
+    gbLinesDrawn = 0;
+
+    for (gbSteps = 0;
+         gbSteps < GB_MAX_STEPS_PER_FRAME;
+         gbSteps++) {
+
+        __gb_step_cpu(&gbCore);
+
+        if (gbCore.gb_frame) {
+            return TRUE;
+        }
+    }
+
+    return FALSE;
+}
+
+
+static Boolean
+GBRunOneFrameFast(void)
+{
+    gbLinesDrawn = 0;
+    gbSteps = 0;
+
+    gb_run_frame(&gbCore);
+    return TRUE;
+}
+
+
+static void
+GBClearDivCounters(void)
+{
+    gbDivFullPeriod = 0;
+    gbDivPrefixPeriod = 0;
+    gbDivFinalPeriod = 0;
+    gbDivFallbackPeriod = 0;
+    gbMeasuredDivFull = 0;
+    gbMeasuredDivPrefix = 0;
+    gbMeasuredDivFinal = 0;
+    gbMeasuredDivFallback = 0;
+}
+
+
+static byte
+GBModeDivLevel(word mode)
+{
+    switch (mode) {
+    case MODE_CORE_V1:
+    case MODE_FS2_V1:
+    case MODE_FULL_V1:
+        return 1;
+
+    case MODE_CORE_V2:
+    case MODE_FS2_V2:
+    case MODE_FULL_V2:
+        return 2;
+    }
+
+    return 0;
+}
+
+
+static void
+GBResetMeasurement(void)
+{
+    gbMeasuredGuestFPS = 0;
+    gbMeasuredBlitFPS = 0;
+    gbMeasuredDivFull = 0;
+    gbMeasuredDivPrefix = 0;
+    gbMeasuredDivFinal = 0;
+    gbMeasuredDivFallback = 0;
+    gbGuestFramesInPeriod = 0;
+    gbBlitsInPeriod = 0;
+    gbDivFullPeriod = 0;
+    gbDivPrefixPeriod = 0;
+    gbDivFinalPeriod = 0;
+    gbDivFallbackPeriod = 0;
+    gbPeriodStart = TimerGetCount();
+}
+
+
+static Boolean
+GBUpdateMeasurement(void)
+{
+    dword now;
+    dword elapsed;
+    dword delta;
+
+    now = TimerGetCount();
+    elapsed = now - gbPeriodStart;
+
+    /* Two-second window: stable enough for both FPS and helper rates. */
+    if (elapsed < 120L) {
+        return FALSE;
+    }
+
+    gbMeasuredGuestFPS =
+        (word)(((dword)gbGuestFramesInPeriod * 60L) / elapsed);
+
+    gbMeasuredBlitFPS =
+        (word)(((dword)gbBlitsInPeriod * 60L) / elapsed);
+
+    delta = gbDivFullPeriod;
+    gbMeasuredDivFull =
+        (word)((delta * 60L) / elapsed);
+
+    delta = gbDivPrefixPeriod;
+    gbMeasuredDivPrefix =
+        (word)((delta * 60L) / elapsed);
+
+    delta = gbDivFinalPeriod;
+    gbMeasuredDivFinal =
+        (word)((delta * 60L) / elapsed);
+
+    delta = gbDivFallbackPeriod;
+    gbMeasuredDivFallback =
+        (word)((delta * 60L) / elapsed);
+
+    gbGuestFramesInPeriod = 0;
+    gbBlitsInPeriod = 0;
+    gbDivFullPeriod = 0;
+    gbDivPrefixPeriod = 0;
+    gbDivFinalPeriod = 0;
+    gbDivFallbackPeriod = 0;
+    gbPeriodStart = now;
+
+    return TRUE;
+}
+
+
+/***********************************************************************
+ * Drawing. The dynamic path never clears the whole window.
+ ***********************************************************************/
+
+static void
+GBDrawStaticScreen(GStateHandle gstate)
+{
+    GrSetAreaColor(gstate, CF_INDEX, C_WHITE, 0, 0);
+    GrFillRect(gstate, 0, 0, 559, 199);
+
+    GrSetTextColor(gstate, CF_INDEX, C_BLACK, 0, 0);
+    GrSetFont(gstate, FID_DTC_URW_SANS, MakeWWFixed(12.0));
+    GrDrawText(gstate, 12, 10, "GB DIV2 BENCH v1.6", 0);
+
+    if (gb4Frame != NULL) {
+        GrDrawImage(gstate,
+                    12,
+                    34,
+                    IBS_1,
+                    (const Bitmap *)gb4Frame);
+    }
+
+    GrSetLineColor(gstate, CF_INDEX, C_BLACK, 0, 0);
+    GrDrawRect(gstate, 11, 33, 172, 178);
+
+    GrSetFont(gstate, FID_DTC_URW_SANS, MakeWWFixed(9.0));
+    GrDrawText(gstate, 190, 34, "BUILD:", 0);
+    GrDrawText(gstate, 190, 52, "STATE:", 0);
+    GrDrawText(gstate, 190, 70, "MODE:", 0);
+    GrDrawText(gstate, 190, 88, "GUEST FPS:", 0);
+    GrDrawText(gstate, 190, 106, "BLIT FPS:", 0);
+    GrDrawText(gstate, 190, 124, "CORE ERR:", 0);
+    GrDrawText(gstate, 190, 142, "DIV SIG:", 0);
+
+    GrSetFont(gstate, FID_DTC_URW_SANS, MakeWWFixed(8.0));
+    GrDrawText(gstate, 330, 34, "DIV HELPERS / SEC", 0);
+    GrDrawText(gstate, 330, 52, "FULL:", 0);
+    GrDrawText(gstate, 330, 70, "PREFIX:", 0);
+    GrDrawText(gstate, 330, 88, "FINAL:", 0);
+    GrDrawText(gstate, 330, 106, "FALLBACK:", 0);
+    GrDrawText(gstate, 330, 130, "1/2/3 CORE: OFF / V1 / V2", 0);
+    GrDrawText(gstate, 330, 146, "4/5/6 FS2:  OFF / V1 / V2", 0);
+    GrDrawText(gstate, 330, 162, "7/8/9 FULL: OFF / V1 / V2", 0);
+    GrDrawText(gstate, 330, 180, "0 CLEAR  R RESET  ESC QUIT", 0);
+}
+
+
+static void
+GBDrawDynamicStatus(GStateHandle gstate)
+{
+    char text[11];
+
+    GrSetAreaColor(gstate, CF_INDEX, C_WHITE, 0, 0);
+    GrFillRect(gstate, 248, 30, 326, 160);
+    GrFillRect(gstate, 402, 42, 500, 116);
+
+    GrSetTextColor(gstate, CF_INDEX, C_BLACK, 0, 0);
+    GrSetFont(gstate, FID_DTC_URW_SANS, MakeWWFixed(9.0));
+
+    GrDrawText(gstate, 250, 34, GBBuildText(), 0);
+    GrDrawText(gstate, 250, 52, GBStageText(), 0);
+    GrDrawText(gstate, 250, 70, GBModeText(), 0);
+
+    GBWordToText(gbMeasuredGuestFPS, text);
+    GrDrawText(gstate, 290, 88, text, 0);
+
+    GBWordToText(gbMeasuredBlitFPS, text);
+    GrDrawText(gstate, 290, 106, text, 0);
+
+    GBWordToText(gbCoreErrors, text);
+    GrDrawText(gstate, 290, 124, text, 0);
+
+    GrDrawText(gstate,
+               250,
+               142,
+               gbDivSignatureValid ? "OK" : "BAD",
+               0);
+
+    GBWordToText(gbMeasuredDivFull, text);
+    GrDrawText(gstate, 410, 52, text, 0);
+
+    GBWordToText(gbMeasuredDivPrefix, text);
+    GrDrawText(gstate, 410, 70, text, 0);
+
+    GBWordToText(gbMeasuredDivFinal, text);
+    GrDrawText(gstate, 410, 88, text, 0);
+
+    GBWordToText(gbMeasuredDivFallback, text);
+    GrDrawText(gstate, 410, 106, text, 0);
+}
+
+
+static void
+GBRedrawAll(void)
+{
+    GStateHandle gstate;
+
+    if (gbWindow == 0) {
+        return;
+    }
+
+    gstate = GrCreateState(gbWindow);
+    GBDrawStaticScreen(gstate);
+    GBDrawDynamicStatus(gstate);
+    GrDestroyState(gstate);
+}
+
+
+static void
+GBRedrawStatus(void)
+{
+    GStateHandle gstate;
+
+    if (gbWindow == 0) {
+        return;
+    }
+
+    gstate = GrCreateState(gbWindow);
+    GBDrawDynamicStatus(gstate);
+    GrDestroyState(gstate);
+}
+
+
+static void
+GBBlit4(void)
+{
+    GStateHandle gstate;
+
+    if ((gbWindow == 0) || (gb4Frame == NULL)) {
+        return;
+    }
+
+    gstate = GrCreateState(gbWindow);
+    GrDrawImage(gstate,
+                12,
+                34,
+                IBS_1,
+                (const Bitmap *)gb4Frame);
+    GrDestroyState(gstate);
+}
+
+
+static void
+GBBlitMono(void)
+{
+    GStateHandle gstate;
+
+    if ((gbWindow == 0) || (gbMonoFrame == NULL)) {
+        return;
+    }
+
+    gstate = GrCreateState(gbWindow);
+    GrDrawImage(gstate,
+                12,
+                34,
+                IBS_1,
+                (const Bitmap *)gbMonoFrame);
+    GrDestroyState(gstate);
+}
+
+
+/***********************************************************************
+ * Core reset.
+ ***********************************************************************/
+
+static Boolean
+GBResetCore(void)
+{
+    GBZeroBytes((byte *)&gbCore, (word)sizeof(gbCore));
+
+    gbInitResult =
+        gb_init(&gbCore, NULL, NULL, NULL, NULL, NULL);
+
+    if (gbInitResult != GB_INIT_NO_ERROR) {
+        return FALSE;
+    }
+
+    gb_init_lcd(&gbCore, NULL);
+    gbCore.direct.joypad_state.joypad = 0xFF;
+
+    gbCoreErrors = 0;
+    return TRUE;
+}
+
+
+/***********************************************************************
+ * Frame-skip phase. The guest always executes a complete frame. Only
+ * renderer and GEOS transfer are suppressed on skipped display frames.
+ ***********************************************************************/
+
+static Boolean
+GBTakeDisplayFrame(byte divisor)
+{
+    Boolean renderNow;
+
+    renderNow = (gbSkipPhase == 0);
+
+    gbSkipPhase++;
+    if (gbSkipPhase >= divisor) {
+        gbSkipPhase = 0;
+    }
+
+    return renderNow;
+}
+
+
+/***********************************************************************
+ * Work scheduling.
+ ***********************************************************************/
+
+static void
+GBQueueWork(void)
+{
+    if ((!gbWorkQueued) &&
+        gbRunning &&
+        (gbWindow != 0) &&
+        (gbStage == STAGE_RUNNING)) {
+
+        gbWorkQueued = TRUE;
+        @send, forceQueue process::MSG_GBROW_WORK();
+    }
+}
+
+
+static void
+GBSetMode(word mode)
+{
+    if ((mode < MODE_CORE_BASE) ||
+        (mode > MODE_FULL_V2)) {
+
+        return;
+    }
+
+    gbMode = mode;
+    gbDivLevel = GBModeDivLevel(mode);
+    gbUseRow8Renderer = (mode >= MODE_FS2_BASE);
+    gbSkipPhase = 0;
+
+    GBClearDivCounters();
+    GBResetMeasurement();
+    GBRedrawAll();
+    GBQueueWork();
+}
+
+
+/***********************************************************************
+ * Staged startup.
+ ***********************************************************************/
+
+static void
+GBQueueNextStage(void)
+{
+    @send, forceQueue process::MSG_GBROW_NEXT_STAGE();
+}
+
+
+@method GBRowProcessClass, MSG_META_EXPOSED
+{
+    GStateHandle gstate;
+
+    gbWindow = win;
+
+    gstate = GrCreateState(win);
+    GrBeginUpdate(gstate);
+
+    GBDrawStaticScreen(gstate);
+    GBDrawDynamicStatus(gstate);
+
+    GrEndUpdate(gstate);
+    GrDestroyState(gstate);
+
+    if (!gbStarted) {
+        gbStarted = TRUE;
+        GBQueueNextStage();
+    } else if (gbStage == STAGE_RUNNING) {
+        gbRunning = TRUE;
+        GBResetMeasurement();
+        GBQueueWork();
+    }
+}
+
+
+@method GBRowProcessClass, MSG_GBROW_NEXT_STAGE
+{
+    word bytesRead;
+
+    if ((gbWindow == 0) ||
+        (gbStage == STAGE_RUNNING) ||
+        (gbStage == STAGE_FAILED)) {
+
+        return;
+    }
+
+    gbStage++;
+    GBRedrawStatus();
+
+    switch (gbStage) {
+    case STAGE_ALLOC_4BPP:
+        gb4Handle =
+            MemAlloc((word)sizeof(GB4FrameBuffer),
+                     HF_SWAPABLE,
+                     HAF_STANDARD);
+
+        if (gb4Handle == 0) {
+            GBFail(8);
+            break;
+        }
+
+        gb4Frame =
+            (GB4FrameBuffer *)MemLock(gb4Handle);
+
+        if (gb4Frame == NULL) {
+            GBFail(9);
+            break;
+        }
+
+        GBInit4Buffer();
+        break;
+
+    case STAGE_ALLOC_MONO:
+        gbMonoHandle =
+            MemAlloc((word)sizeof(GBMonoFrameBuffer),
+                     HF_SWAPABLE,
+                     HAF_STANDARD);
+
+        if (gbMonoHandle == 0) {
+            GBFail(6);
+            break;
+        }
+
+        gbMonoFrame =
+            (GBMonoFrameBuffer *)MemLock(gbMonoHandle);
+
+        if (gbMonoFrame == NULL) {
+            GBFail(7);
+            break;
+        }
+
+        GBInitMonoBuffer();
+        break;
+
+    case STAGE_ALLOC_BANK0:
+        gbBank0Handle =
+            MemAlloc(16384, HF_SWAPABLE, HAF_STANDARD);
+
+        if (gbBank0Handle == 0) {
+            GBFail(10);
+            break;
+        }
+
+        gbFastBank0 = (byte *)MemLock(gbBank0Handle);
+
+        if (gbFastBank0 == NULL) {
+            GBFail(11);
+        }
+        break;
+
+    case STAGE_ALLOC_BANK1:
+        gbBank1Handle =
+            MemAlloc(16384, HF_SWAPABLE, HAF_STANDARD);
+
+        if (gbBank1Handle == 0) {
+            GBFail(12);
+            break;
+        }
+
+        gbFastBank1 = (byte *)MemLock(gbBank1Handle);
+
+        if (gbFastBank1 == NULL) {
+            GBFail(13);
+        }
+        break;
+
+    case STAGE_OPEN_FILE:
+        FilePushDir();
+        gbDirPushed = TRUE;
+
+        FileSetStandardPath(SP_APPLICATION);
+
+        gbRomFile =
+            FileOpen("ExtrApps\\FLAPPY.GB",
+                     FILE_ACCESS_R | FILE_DENY_W);
+
+        if (gbRomFile == 0) {
+            GBFail(20);
+        }
+        break;
+
+    case STAGE_READ_BANK0:
+        bytesRead =
+            FileRead(gbRomFile, gbFastBank0, 16384, FALSE);
+
+        if (bytesRead != 16384) {
+            GBFail(21);
+        }
+        break;
+
+    case STAGE_READ_BANK1:
+        bytesRead =
+            FileRead(gbRomFile, gbFastBank1, 16384, FALSE);
+
+        GBCloseFileAndPath();
+
+        if (bytesRead != 16384) {
+            GBFail(22);
+        }
+        break;
+
+    case STAGE_VALIDATE_ROM:
+        if ((gbFastBank0[0x0104] != 0xCE) ||
+            (gbFastBank0[0x0148] != 0x00)) {
+
+            GBFail(23);
+            break;
+        }
+
+        gbDivSignatureValid = GBValidateDivSignature();
+
+        if (!gbDivSignatureValid) {
+            GBFail(24);
+        }
+        break;
+
+    case STAGE_CALL_INIT:
+        if (!GBResetCore()) {
+            GBFail((word)(30 + gbInitResult));
+        }
+        break;
+
+    case STAGE_FIRST_FRAME:
+        gbRenderEnabled = TRUE;
+        gbPackEnabled = TRUE;
+        gbUseFastRenderer = FALSE;
+
+        if (!GBRunOneFrameSafe()) {
+            GBFail(40);
+            break;
+        }
+
+        gbStage = STAGE_RUNNING;
+        gbRunning = TRUE;
+        gbFailureCode = 0;
+        gbMode = MODE_CORE_BASE;
+        gbUseRow8Renderer = FALSE;
+        gbDivLevel = 0;
+        GBClearDivCounters();
+
+        GBResetMeasurement();
+        GBRedrawAll();
+        GBQueueWork();
+        return;
+    }
+
+    GBRedrawStatus();
+
+    if ((gbStage != STAGE_RUNNING) &&
+        (gbStage != STAGE_FAILED)) {
+
+        GBQueueNextStage();
+    }
+}
+
+
+/***********************************************************************
+ * Maximum-throughput worker.
+ ***********************************************************************/
+
+@method GBRowProcessClass, MSG_GBROW_WORK
+{
+    Boolean updateStatus;
+    Boolean renderThisFrame;
+
+    gbWorkQueued = FALSE;
+
+    if ((!gbRunning) ||
+        (gbWindow == 0) ||
+        (gbStage != STAGE_RUNNING)) {
+
+        return;
+    }
+
+    gbDivLevel = GBModeDivLevel(gbMode);
+
+    switch (gbMode) {
+    case MODE_CORE_BASE:
+    case MODE_CORE_V1:
+    case MODE_CORE_V2:
+        gbUseRow8Renderer = FALSE;
+        gbRenderEnabled = FALSE;
+        gbPackEnabled = FALSE;
+        gbUseFastRenderer = FALSE;
+
+        if (!GBRunOneFrameFast()) {
+            GBFail(40);
+            GBRedrawStatus();
+            return;
+        }
+
+        gbGuestFramesInPeriod++;
+        break;
+
+    case MODE_FS2_BASE:
+    case MODE_FS2_V1:
+    case MODE_FS2_V2:
+        gbUseRow8Renderer = TRUE;
+        gbPackEnabled = TRUE;
+        gbUseFastRenderer = TRUE;
+        renderThisFrame = GBTakeDisplayFrame(2);
+        gbRenderEnabled = renderThisFrame;
+
+        if (!GBRunOneFrameFast()) {
+            GBFail(40);
+            GBRedrawStatus();
+            return;
+        }
+
+        gbGuestFramesInPeriod++;
+        if (renderThisFrame) {
+            GBBlit4();
+            gbBlitsInPeriod++;
+        }
+        break;
+
+    case MODE_FULL_BASE:
+    case MODE_FULL_V1:
+    case MODE_FULL_V2:
+        gbUseRow8Renderer = TRUE;
+        gbRenderEnabled = TRUE;
+        gbPackEnabled = TRUE;
+        gbUseFastRenderer = TRUE;
+
+        if (!GBRunOneFrameFast()) {
+            GBFail(40);
+            GBRedrawStatus();
+            return;
+        }
+
+        gbGuestFramesInPeriod++;
+        GBBlit4();
+        gbBlitsInPeriod++;
+        break;
+    }
+
+    updateStatus = GBUpdateMeasurement();
+
+    if (updateStatus) {
+        GBRedrawStatus();
+    }
+
+    GBQueueWork();
+}
+
+
+/***********************************************************************
+ * Reset and keyboard.
+ ***********************************************************************/
+
+@method GBRowProcessClass, MSG_GBROW_RESET
+{
+    if ((gbStage != STAGE_RUNNING) ||
+        (gbFastBank0 == NULL)) {
+
+        return;
+    }
+
+    gbRunning = FALSE;
+    gbWorkQueued = FALSE;
+    gbSkipPhase = 0;
+    gbDivLevel = GBModeDivLevel(gbMode);
+    gbUseRow8Renderer = (gbMode >= MODE_FS2_BASE);
+    GBClearDivCounters();
+
+    GBInit4Buffer();
+
+    if (!GBResetCore()) {
+        GBFail((word)(30 + gbInitResult));
+        GBRedrawStatus();
+        return;
+    }
+
+    gbRenderEnabled = TRUE;
+
+    if (!GBRunOneFrameSafe()) {
+        GBFail(40);
+        GBRedrawStatus();
+        return;
+    }
+
+    gbRunning = TRUE;
+    gbFailureCode = 0;
+    GBResetMeasurement();
+
+    GBRedrawAll();
+    GBQueueWork();
+}
+
+
+@method GBRowProcessClass, MSG_META_KBD_CHAR
+{
+    byte key;
+    byte mask;
+    Boolean pressed;
+
+    key = (byte)character;
+    mask = 0;
+
+    if (flags & CF_FIRST_PRESS) {
+        switch (key) {
+        case '1':
+            GBSetMode(MODE_CORE_BASE);
+            return;
+        case '2':
+            GBSetMode(MODE_CORE_V1);
+            return;
+        case '3':
+            GBSetMode(MODE_CORE_V2);
+            return;
+        case '4':
+            GBSetMode(MODE_FS2_BASE);
+            return;
+        case '5':
+            GBSetMode(MODE_FS2_V1);
+            return;
+        case '6':
+            GBSetMode(MODE_FS2_V2);
+            return;
+        case '7':
+            GBSetMode(MODE_FULL_BASE);
+            return;
+        case '8':
+            GBSetMode(MODE_FULL_V1);
+            return;
+        case '9':
+            GBSetMode(MODE_FULL_V2);
+            return;
+
+        case '0':
+            GBClearDivCounters();
+            GBResetMeasurement();
+            GBRedrawStatus();
+            return;
+
+        case 'r':
+        case 'R':
+            @send, forceQueue process::MSG_GBROW_RESET();
+            return;
+
+        case 'q':
+        case 'Q':
+        case VC_ESCAPE:
+            gbRunning = FALSE;
+            gbWorkQueued = FALSE;
+            @send, forceQueue application::MSG_META_QUIT();
+            return;
+        }
+    }
+
+    switch (key) {
+    case VC_RIGHT:
+        mask = JOYPAD_RIGHT;
+        break;
+
+    case VC_LEFT:
+        mask = JOYPAD_LEFT;
+        break;
+
+    case VC_UP:
+        mask = JOYPAD_UP;
+        break;
+
+    case VC_DOWN:
+        mask = JOYPAD_DOWN;
+        break;
+
+    case 'z':
+    case 'Z':
+    case VC_BLANK:
+        mask = JOYPAD_A;
+        break;
+
+    case 'x':
+    case 'X':
+        mask = JOYPAD_B;
+        break;
+
+    case VC_ENTER:
+        mask = JOYPAD_START;
+        break;
+
+    case VC_TAB:
+        mask = JOYPAD_SELECT;
+        break;
+    }
+
+    if ((mask != 0) &&
+        (gbStage == STAGE_RUNNING)) {
+
+        pressed = ((flags & CF_RELEASE) == 0);
+
+        if (pressed) {
+            gbCore.direct.joypad_state.joypad &=
+                (byte)(~mask);
+        } else {
+            gbCore.direct.joypad_state.joypad |= mask;
+        }
+
+        return;
+    }
+
+    @callsuper();
+}
+
+
+/***********************************************************************
+ * Lifecycle.
+ ***********************************************************************/
+
+@method GBRowProcessClass, MSG_META_CONTENT_VIEW_CLOSING
+{
+    gbWindow = 0;
+    gbWorkQueued = FALSE;
+    @callsuper();
+}
+
+
+@method GBRowProcessClass, MSG_META_DETACH
+{
+    gbRunning = FALSE;
+    gbWindow = 0;
+    gbWorkQueued = FALSE;
+    gbDivLevel = 0;
+    gbSkipPhase = 0;
+
+    GBCloseFileAndPath();
+    GBFreeMemory();
+
+    @callsuper();
+}

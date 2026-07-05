@@ -30,3 +30,8 @@ DEPENDENCIES/
 Thumbs.db
 .vscode/
 .idea/
+
+# Required checked-in project overrides
+!experiments/gbdiv2/LOCAL.MK
+!tools/gbprof-live/LOCAL.MK
+!tools/gbprof-live/LOCSYM.MK

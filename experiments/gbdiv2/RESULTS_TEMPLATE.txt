@@ -1,0 +1,59 @@
+GBDIV2 v1.6 RESULTS
+===================
+
+1 CORE OFF:
+Guest FPS =
+
+2 CORE V1:
+Guest FPS =
+FULL/s =
+PREFIX/s =
+FINAL/s =
+FALLBACK/s =
+
+3 CORE V2:
+Guest FPS =
+FULL/s =
+PREFIX/s =
+FINAL/s =
+FALLBACK/s =
+
+4 FS2 OFF:
+Guest FPS =
+Blit FPS =
+
+5 FS2 V1:
+Guest FPS =
+Blit FPS =
+FULL/s =
+PREFIX/s =
+FINAL/s =
+FALLBACK/s =
+
+6 FS2 V2:
+Guest FPS =
+Blit FPS =
+FULL/s =
+PREFIX/s =
+FINAL/s =
+FALLBACK/s =
+
+7 FULL OFF:
+Guest FPS =
+Blit FPS =
+
+8 FULL V1:
+Guest FPS =
+Blit FPS =
+FULL/s =
+PREFIX/s =
+FINAL/s =
+FALLBACK/s =
+
+9 FULL V2:
+Guest FPS =
+Blit FPS =
+FULL/s =
+PREFIX/s =
+FINAL/s =
+FALLBACK/s =

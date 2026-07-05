@@ -1,0 +1,28 @@
+GBDIV2 v1.6 validation performed in the build workspace
+========================================================
+
+1. PGBROW.H compiled successfully with GCC in GNU89 mode.
+
+2. Prefix and final helpers were compared against instruction-by-instruction
+   reference implementations for 100,000 random CPU states each:
+
+     DIV prefix/final helpers: 200000 randomized cases OK
+
+   Compared state included CPU registers, flags, PC, SP and all WRAM bytes.
+
+3. Three Peanut-GB instances ran the supplied FLAPPY.GB for 300 frames:
+
+     instance A: helpers off
+     instance B: DIV v1
+     instance C: DIV v2
+
+   Input was identical and included several A-button presses. Full emulator
+   state was byte-identical after every frame:
+
+     300 frames identical.
+
+   The test exercised all new paths (FULL, PREFIX, FINAL and FALLBACK).
+
+These are host-side semantic tests. The project has not been compiled with the
+Nokia 9110 PC/GEOS SDK in this workspace; BUILD_GBDIV2.BAT is the device-SDK
+build test.

@@ -1,0 +1,14 @@
+GBPROF v1.5j build fix
+
+The previous split-resource build could not export C routines because Glue
+could not see their names when the engine object was compiled with -v- -y-.
+
+v1.5j avoids cross-resource calls entirely:
+- GBPROF.GOC and the engine compile into one GBPROF.OBJ.
+- GBENG.INC is included at the end of GBPROF.GOC.
+- #pragma option -v- -y- suppresses debug scopes only around the large core.
+- #pragma option -v -y restores normal symbol generation afterwards.
+- No GP exports are required.
+
+Expected dependency source list: GBPROF.GOC only.
+Expected final link input: GBPROF.OBJ only.

@@ -1,0 +1,51 @@
+GBPROF v1.5f RESULTS
+===================
+
+ROM / scene:
+How long each mode was observed:
+
+MODE 4 - OPCODE CORE
+--------------------
+GUEST FPS:
+OP/s:
+DIV/s:
+
+TOP OPCODES:
+1.
+2.
+3.
+4.
+5.
+6.
+7.
+8.
+
+TOP CB:
+1.
+2.
+3.
+
+MODE 5 - MEMORY CORE
+--------------------
+GUEST FPS:
+READ/s:
+WRITE/s:
+DIV/s:
+
+DATA MEMORY:
+1.
+2.
+3.
+4.
+5.
+6.
+
+MODE 6 - BOTH + FS2 (optional)
+------------------------------
+GUEST FPS:
+BLIT FPS:
+OP/s:
+READ/s:
+WRITE/s:
+DIV/s:
+Notes on responsiveness / picture:

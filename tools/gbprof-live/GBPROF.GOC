@@ -1,0 +1,164 @@
+/***********************************************************************
+ *
+ * GBPROF v1.5j -- single-object selective-debug build
+ *
+ * The GOC classes and emulator are linked into one Borland object, avoiding
+ * cross-resource C entry points.  Debug/local-scope records are disabled only
+ * while GBENG.INC is compiled; normal symbols remain enabled for the GOC class
+ * and application-object definitions required by Glue.
+ *
+ ***********************************************************************/
+
+@include <stdapp.goh>
+#include <geos.h>
+#include "GBENG.H"
+
+@class GBRowProcessClass, GenProcessClass;
+    @message void MSG_GBROW_NEXT_STAGE();
+    @message void MSG_GBROW_WORK();
+    @message void MSG_GBROW_RESET();
+@endc;
+
+@classdecl GBRowProcessClass, neverSaved;
+
+
+@start AppResource;
+
+@object GenApplicationClass GBRowApp = {
+    GI_visMoniker = list {
+        @GBRowTextMoniker
+    }
+    GI_comp = @GBRowPrimary;
+    gcnList(MANUFACTURER_ID_GEOWORKS, GAGCNLT_WINDOWS) = @GBRowPrimary;
+}
+
+@visMoniker GBRowTextMoniker = "GB Profiler v1.5j";
+
+@end AppResource;
+
+
+@start Interface;
+
+@object GenPrimaryClass GBRowPrimary = {
+    GI_comp = @GBRowView;
+    ATTR_GEN_DISPLAY_NOT_MINIMIZABLE;
+}
+
+@object GenViewClass GBRowView = {
+    GVI_content = process;
+
+    GVI_docBounds = {
+        0, 0,
+        560, 200
+    };
+
+    GVI_horizAttrs = @default | GVDA_NO_LARGER_THAN_CONTENT;
+    GVI_vertAttrs  = @default | GVDA_NO_LARGER_THAN_CONTENT;
+}
+
+@end Interface;
+
+
+static void
+GBShellQueueAfterEngine(void)
+{
+    if (GBEngineNeedNextStage()) {
+        @send, forceQueue process::MSG_GBROW_NEXT_STAGE();
+    } else if (GBEngineRequestWork()) {
+        @send, forceQueue process::MSG_GBROW_WORK();
+    }
+}
+
+
+@method GBRowProcessClass, MSG_META_EXPOSED
+{
+    GStateHandle gstate;
+
+    gstate = GrCreateState(win);
+    GrBeginUpdate(gstate);
+
+    GBEngineExpose(win, gstate);
+
+    GrEndUpdate(gstate);
+    GrDestroyState(gstate);
+
+    GBShellQueueAfterEngine();
+}
+
+
+@method GBRowProcessClass, MSG_GBROW_NEXT_STAGE
+{
+    GBEngineNextStage();
+    GBShellQueueAfterEngine();
+}
+
+
+@method GBRowProcessClass, MSG_GBROW_WORK
+{
+    GBEngineWork();
+
+    if (GBEngineRequestWork()) {
+        @send, forceQueue process::MSG_GBROW_WORK();
+    }
+}
+
+
+@method GBRowProcessClass, MSG_GBROW_RESET
+{
+    GBEngineReset();
+
+    if (GBEngineRequestWork()) {
+        @send, forceQueue process::MSG_GBROW_WORK();
+    }
+}
+
+
+@method GBRowProcessClass, MSG_META_KBD_CHAR
+{
+    word action;
+
+    action = GBEngineKey((word)character, (word)flags);
+
+    switch (action) {
+    case GB_ENGINE_KEY_HANDLED:
+        if (GBEngineRequestWork()) {
+            @send, forceQueue process::MSG_GBROW_WORK();
+        }
+        return;
+
+    case GB_ENGINE_KEY_RESET:
+        @send, forceQueue process::MSG_GBROW_RESET();
+        return;
+
+    case GB_ENGINE_KEY_QUIT:
+        @send, forceQueue application::MSG_META_QUIT();
+        return;
+    }
+
+    @callsuper();
+}
+
+
+@method GBRowProcessClass, MSG_META_CONTENT_VIEW_CLOSING
+{
+    GBEngineContentClosing();
+    @callsuper();
+}
+
+
+@method GBRowProcessClass, MSG_META_DETACH
+{
+    GBEngineDetach();
+    @callsuper();
+}
+
+/***********************************************************************
+ * Emulator and profiler implementation.
+ *
+ * Borland 4.52 supports changing -v/-y between function declarations.
+ * Suppress debug and line records only for the large Peanut-GB core, then
+ * restore the command-line settings for any compiler-generated tail code.
+ ***********************************************************************/
+#pragma option -v- -y-
+#include "GBENG.INC"
+#pragma option -v -y

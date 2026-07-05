@@ -45,3 +45,15 @@ A decoded tile cache slowed the program despite nearly perfect hit rates. A simp
 ## 10. Current result
 
 Combining DIV and ROW8 reaches 13 guest/display FPS on the real Nokia 9110: 2.6× the first complete measured path.
+
+## 11. Fixed frame skip
+
+Guest execution and display updates were separated. FS2 reached 18 guest / 9 display FPS; FS3 reached 21 / 7. FS2 became the practical fixed mode.
+
+## 12. Current-workload profiler
+
+A rate-based profiler measured 28,126 opcodes/s and 19,135 data reads/s on the current engine. It also documented a working selective-debug workaround for an old Glue scope assertion.
+
+## 13. DIV v2 and the assembly boundary
+
+Shorter guarded division blocks reduced fallback by about 62–63% and preserved the 28-FPS CPU ceiling and 18/9 FS2 result. With the main C opportunities now diminishing, the next controlled experiment is targeted 16-bit x86 assembly rather than a full interpreter rewrite.
