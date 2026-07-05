@@ -44,6 +44,22 @@ The profiler runs these stages separately.
 | Direct packed renderer + blit | 5 | 5 |
 | Static 4-bpp blit | — | 44 |
 
+## GBTABLE v0.6
+
+| Mode | Guest FPS | Blit FPS |
+|---|---:|---:|
+| Core only | 22 | — |
+| Original packed renderer | 6 | — |
+| Lookup-table packed renderer | 12 | — |
+| Lookup-table renderer + blit | 9 | 9 |
+| Static 4-bpp blit | — | 44 |
+
+This is the first clear optimization win on real hardware:
+
+- packed rendering doubled from 6 to 12 guest FPS;
+- the complete path increased from 5 to 9 guest FPS;
+- static GEOS blit performance remained unchanged, confirming that the gain came from the renderer.
+
 ## Conclusions
 
 ### 1. Timers were not the limiting factor
@@ -64,7 +80,11 @@ The separate conversion from 160 generated pixels to 80 packed 4-bpp bytes costs
 
 ### 5. The first direct renderer was a useful failure
 
-Writing directly into the packed framebuffer did not help because its inner loops still did too much work. The next renderer changes the number of iterations and sprite selection strategy instead of only changing the destination format.
+Writing directly into the packed framebuffer did not help because its inner loops still did too much work.
+
+### 6. Algorithmic changes did help
+
+The lookup-table renderer reduced background work to four-pixel groups and avoided scanning all sprites on every line. It doubled packed-renderer throughput and raised the full path by 80 percent.
 
 ## Benchmark reporting format
 

@@ -18,11 +18,11 @@
 - [x] Replace accumulating continual timers with self-queued work
 - [x] Test 4-bpp versus 1-bpp GEOS blits
 - [x] Document the failed direct-packed renderer
-- [ ] Measure the lookup-table renderer
+- [x] Measure the lookup-table renderer: 12 FPS packed, 9 FPS full
 
 ## Phase 3 — make one ROM playable
 
-- [ ] Bring the full path above 10 FPS
+- [ ] Bring the full path above 10 FPS (currently 9 FPS)
 - [ ] Add adaptive frame skipping
 - [ ] Decouple guest timing from display timing
 - [ ] Verify input remains responsive under load

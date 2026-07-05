@@ -45,7 +45,9 @@ The profiler separates emulation, rendering, and GEOS display transfer:
 | CPU/core with LCD renderer disabled | 21–22 guest FPS |
 | Original Peanut PPU only | 7 guest FPS |
 | Original PPU plus 4-bpp packing | 6 guest FPS |
-| Full 4-bpp path including GEOS blit | 5 guest FPS |
+| Full original 4-bpp path including GEOS blit | 5 guest FPS |
+| Lookup-table packed renderer, no blit | 12 guest FPS |
+| Lookup-table renderer with GEOS blit | 9 guest FPS |
 | Static 160×144 4-bpp GEOS blit | 44 FPS |
 | Static 160×144 1-bpp GEOS blit | 29 FPS |
 

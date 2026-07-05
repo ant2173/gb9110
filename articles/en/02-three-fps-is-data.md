@@ -129,9 +129,9 @@ The destination format changed. The algorithm did not change enough.
 
 That negative result was valuable. It prevented weeks of polishing the wrong optimization.
 
-## The next experiment
+## The experiment that finally worked
 
-The current renderer changes the amount of work:
+The next renderer changed the amount of work:
 
 - four background pixels decoded through a lookup table;
 - one 16-bit write for four packed pixels;
@@ -139,13 +139,23 @@ The current renderer changes the amount of work:
 - first-ten-sprites-per-line lists prepared once;
 - only sprites touching the current line visited.
 
-The target is not yet 60 FPS. That would be dishonest.
+The real-hardware result was the first decisive optimization win:
 
-The immediate target is to move the complete path from 5 FPS into a range where adaptive frame skipping can make the test ROM meaningfully playable. After that, the 21–22 FPS CPU ceiling becomes the next problem.
+```text
+original packed renderer:  6 FPS
+lookup-table packed path: 12 FPS
+
+original complete path:     5 FPS
+lookup-table complete path: 9 FPS
+```
+
+The packed renderer doubled in speed, while the complete path improved by 80 percent.
+
+The target is still not 60 FPS. The CPU-only ceiling remains 21–22 guest FPS, so the next major task moves from the PPU to the LR35902 core.
 
 On old hardware, three FPS was not a verdict.
 
-It was the first useful measurement.
+It was the first useful measurement—and it led to nine.
 
 ---
 

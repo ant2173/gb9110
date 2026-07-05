@@ -9,4 +9,10 @@ The design attempts to reduce algorithmic work through:
 - precomputed first-ten-sprites-per-line lists;
 - per-line sprite filtering.
 
-This experiment has not yet been measured on the real device at the time of this draft.
+Measured on the real device:
+
+- core only: 22 guest FPS;
+- original packed renderer: 6 guest FPS;
+- table packed renderer: 12 guest FPS;
+- table renderer with GEOS blit: 9 guest FPS;
+- static 4-bpp blit: 44 FPS.

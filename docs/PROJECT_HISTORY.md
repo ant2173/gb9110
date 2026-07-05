@@ -65,4 +65,4 @@ The current lookup-table renderer attempts to:
 - preselect the first ten sprites touching each scanline;
 - visit only relevant sprites during line rendering.
 
-It has not yet been measured on hardware.
+Real-hardware measurement showed 12 guest FPS without the GEOS blit and 9 FPS for the complete path, compared with 6 and 5 FPS respectively for the original renderer.

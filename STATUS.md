@@ -32,9 +32,10 @@
 | GBPROF v0.3 | 22 | — | 6 | 5 | 44 | 29 |
 | GBREN v0.4 | 22 | 7 | 6 | 5 | 44 | — |
 | GBFAST v0.5 | 21 | — | 6 | 5 | 44 | — |
+| GBTABLE v0.6 | 22 | — | 12 | 9 | 44 | — |
 
-`GBTABLE v0.6` is the current unmeasured experiment.
+`GBTABLE v0.6` is the first renderer rewrite to produce a clear hardware speedup.
 
 ## Honest headline
 
-A real Game Boy ROM now executes, renders, and accepts input on a real Nokia 9110. The current full path is about 5 FPS, and the CPU-only ceiling is about 21–22 FPS. The project is working, but performance optimization is still the central engineering problem.
+A real Game Boy ROM now executes, renders, and accepts input on a real Nokia 9110. The lookup-table full path is now about 9 FPS, while the CPU-only ceiling remains about 21–22 FPS. The project is working, but performance optimization is still the central engineering problem.
