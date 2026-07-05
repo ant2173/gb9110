@@ -1,103 +1,98 @@
-# Hardware benchmarks
+# Real-hardware benchmarks
 
-All values below were measured on a real Nokia 9110 development target, not inferred from the PC-hosted SDK emulator.
+All figures below were measured on a real Nokia 9110, not extrapolated from the PC-hosted SDK emulator.
 
-## Why multiple modes exist
+## Measurement rules
 
-A single FPS number is not useful until the frame is decomposed into:
+- Let each mode stabilize for at least 5–10 seconds.
+- Record guest FPS and blit/display FPS separately where available.
+- Compare modes inside the same binary whenever possible.
+- Verify visual correctness after every renderer change.
+- Static blit tests contain no emulation and measure only the GEOS transfer path.
 
-1. Game Boy CPU and hardware timing;
-2. PPU line rendering;
-3. conversion into GEOS bitmap format;
-4. GEOS display transfer;
-5. UI/status overhead.
+## Milestone table
 
-The profiler runs these stages separately.
+| Build / experiment | CPU/core | Packed renderer | Full path | Static 4-bpp blit | Result |
+|---|---:|---:|---:|---:|---|
+| GBPROF / GBREN baseline | 21–22 | 6 | 5 | 44 | Initial hardware decomposition |
+| GBFAST v0.5 | 21 | 6 | 5 | 44 | Direct packing did not help |
+| GBTABLE v0.6 | 22 | 12 | 9 | 44 | First decisive renderer win |
+| GBHOT v0.8 | 25 | 13 | 10 | 44 | Fast ROM/stack/CB paths |
+| GBTIME v0.9 | 26–27 | 13 | 10 | 44 | Small housekeeping gain |
+| GBFLAGS v1.0 | 27 | 14 | 10 | 44 | Smaller code, limited speed gain |
+| GBDIV v1.1 | 28 with DIV | — | 10 | 44 | Superinstruction helps CPU |
+| GBTILE v1.2 | — | 11 | 8 | 44 | Tile cache regression |
+| GBROW v1.3 | — | 17 | 12 | 44 | Eight-pixel renderer |
+| GBROW v1.3 + DIV | 28 | — | **13** | 44 | Current best complete path |
 
-## GBPROF v0.3
+## Stage decomposition
 
-| Mode | Guest FPS | Blit FPS |
-|---|---:|---:|
-| Core only | 22 | — |
-| Renderer + packing, no blit | 6 | — |
-| Full 4-bpp path | 5 | 5 |
-| Static 4-bpp blit | — | 44 |
-| Static 1-bpp blit | — | 29 |
+Early baseline:
 
-## GBREN v0.4
+```text
+CPU only                            21–22 FPS
+Original PPU only                       7 FPS
+Original PPU + 4-bpp packing            6 FPS
+Complete original path                  5 FPS
+Static GEOS 4-bpp blit                 44 FPS
+```
 
-| Mode | Guest FPS | Blit FPS |
-|---|---:|---:|
-| Core only | 22 | — |
-| PPU only | 7 | — |
-| PPU + 4-bpp packing | 6 | — |
-| Full 4-bpp path | 5 | 5 |
-| Static 4-bpp blit | — | 44 |
+Current best:
 
-## GBFAST v0.5
+```text
+Optimized CPU + DIV                     28 FPS
+ROW8 renderer, no blit                  17 FPS
+ROW8 full path                          12 FPS
+DIV + ROW8 full path                    13 FPS
+Static GEOS 4-bpp blit                 44 FPS
+```
 
-| Mode | Guest FPS | Blit FPS |
-|---|---:|---:|
-| Core only | 21 | — |
-| Original packed renderer | 6 | — |
-| First direct packed renderer | 6 | — |
-| Direct packed renderer + blit | 5 | 5 |
-| Static 4-bpp blit | — | 44 |
+## What the numbers mean
 
-## GBTABLE v0.6
+### Direct packing was not enough
 
-| Mode | Guest FPS | Blit FPS |
-|---|---:|---:|
-| Core only | 22 | — |
-| Original packed renderer | 6 | — |
-| Lookup-table packed renderer | 12 | — |
-| Lookup-table renderer + blit | 9 | 9 |
-| Static 4-bpp blit | — | 44 |
+Removing a framebuffer copy left the renderer at 6 FPS. The inner algorithm, not just the copy, was expensive.
 
-This is the first clear optimization win on real hardware:
+### Four-pixel LUT rendering worked
 
-- packed rendering doubled from 6 to 12 guest FPS;
-- the complete path increased from 5 to 9 guest FPS;
-- static GEOS blit performance remained unchanged, confirming that the gain came from the renderer.
+`GBTABLE v0.6` processed four background pixels per group and prepared sprite lists per line. Packed throughput doubled from 6 to 12 FPS; the full path rose from 5 to 9 FPS.
 
-## Conclusions
+### CPU changes accumulated gradually
 
-### 1. Timers were not the limiting factor
+Fast instruction fetch, direct WRAM stack access, hot CB handlers, packed flags, and timing cleanup raised core throughput from roughly 22 to 27 FPS.
 
-The early hardware frontend reported roughly 3 FPS regardless of whether the requested timer rate was 10, 30, or 60 FPS. That was not a timer bug: the work itself took longer than the requested period.
+### The division superinstruction is real but bounded
 
-### 2. GEOS blitting is not the dominant cost
+Inside one binary, baseline core measured 26 FPS and DIV core 28 FPS. The fast path triggered around 25 times per guest frame, but safety checks intentionally leave some iterations to the normal interpreter.
 
-A static 4-bpp image can be transferred at roughly 44 FPS. The complete emulated frame is much slower.
+### A perfect cache hit rate can still be slower
 
-### 3. The PPU path dominates
+`GBTILE v1.2` produced 99.98–100% cache hits yet reduced packed performance from 13 to 11 FPS and full performance from 10 to 8 FPS. Pointer arithmetic, dirty checks, counters, and cache-row reconstruction cost more than the compact LUT decoder.
 
-Disabling Peanut-GB line rendering raises throughput from about 7 FPS to about 22 FPS.
+### Reducing loop count worked
 
-### 4. Packing matters, but not enough
+ROW8 changed background work from 40 four-pixel groups to 20 eight-pixel groups per scanline. Packed performance rose from 13 to 17 FPS and the complete path from 10 to 12 FPS. Combining ROW8 with DIV reached 13 FPS.
 
-The separate conversion from 160 generated pixels to 80 packed 4-bpp bytes costs about one FPS in the current profile.
+## Overall improvement
 
-### 5. The first direct renderer was a useful failure
+```text
+First measured full path:   5 FPS
+Current best full path:    13 FPS
+Speedup:                  2.6×
+```
 
-Writing directly into the packed framebuffer did not help because its inner loops still did too much work.
+This is not full Game Boy speed, but it is a substantial measured improvement on unchanged hardware.
 
-### 6. Algorithmic changes did help
-
-The lookup-table renderer reduced background work to four-pixel groups and avoided scanning all sprites on every line. It doubled packed-renderer throughput and raised the full path by 80 percent.
-
-## Benchmark reporting format
-
-Please report:
+## Reporting template
 
 ```text
 Device:
 Build:
 Mode:
 Guest FPS:
-Blit FPS:
+Display/blit FPS:
 Visual correctness:
-Notes:
+Input correctness:
+Run duration:
+Warnings or anomalies:
 ```
-
-Run every mode for at least five seconds before recording values.

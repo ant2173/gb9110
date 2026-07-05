@@ -1,0 +1,57 @@
+GBCPU v0.7 HARDWARE REPORT
+==========================
+
+SUMMARY
+-------
+Profiled frames:
+Instructions:
+CB instructions:
+Memory reads:
+Memory writes:
+Interrupts:
+Profile ticks:
+Profile FPS:
+
+TOP MAIN OPCODES
+----------------
+1.
+2.
+3.
+4.
+5.
+6.
+7.
+8.
+9.
+10.
+
+TOP CB OPCODES
+--------------
+1.
+2.
+3.
+4.
+5.
+6.
+7.
+8.
+9.
+10.
+
+MEMORY
+------
+ROM0:   reads / writes
+ROMX:   reads / writes
+VRAM:   reads / writes
+CART:   reads / writes
+WRAM:   reads / writes
+ECHO:   reads / writes
+OAM:    reads / writes
+UNUSED: reads / writes
+IO:     reads / writes
+HRAM:   reads / writes
+IE:     reads / writes
+
+Visual correctness before profiling:
+Game state profiled:
+Other notes:

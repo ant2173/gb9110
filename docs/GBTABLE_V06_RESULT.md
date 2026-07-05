@@ -1,31 +1,13 @@
-# GBTABLE v0.6 real-hardware result
+# GBTABLE v0.6 — historical result
 
-Measured on a real Nokia 9110:
+`GBTABLE v0.6` was the first decisive hardware optimization.
 
-```text
-1 CORE:          22 guest FPS
-2 ORIGINAL PACK:  6 guest FPS
-3 TABLE PACK:    12 guest FPS
-4 TABLE FULL:     9 guest FPS / 9 blit FPS
-5 BLIT 4BPP:     44 blit FPS
-```
+| Mode | Before | GBTABLE |
+|---|---:|---:|
+| Packed renderer | 6 FPS | 12 FPS |
+| Complete path | 5 FPS | 9 FPS |
+| Static 4-bpp blit | 44 FPS | 44 FPS |
 
-## Interpretation
+The unchanged static blit proved the gain came from the renderer. This milestone established the project's measurement-driven method.
 
-The lookup-table renderer is a successful optimization:
-
-- renderer-only throughput doubled;
-- complete-frame throughput rose from 5 to 9 FPS;
-- the unchanged 44 FPS static blit confirms that the improvement is inside the renderer;
-- the next primary bottleneck is the 21–22 FPS CPU/core ceiling.
-
-Approximate frame-time decomposition:
-
-```text
-core only:       about 45 ms
-table + packing: about 83 ms total
-full frame:      about 111 ms total
-```
-
-The table renderer therefore adds roughly 38 ms over the core, compared with
-roughly 121 ms for the original packed renderer.
+Later ROW8 work reached 17 FPS packed and 12 FPS full; DIV + ROW8 reached 13 FPS complete. See [OPTIMIZATION_HISTORY.md](OPTIMIZATION_HISTORY.md).

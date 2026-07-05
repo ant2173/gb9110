@@ -1,16 +1,13 @@
-# GBHW
+# GBHW v0.2
 
-First hardware-oriented frontend.
+Early hardware-oriented playable frontend.
 
-This is the curated baseline that:
+This milestone provides:
 
-- loads `FLAPPY.GB` from `World\ExtrApps`;
-- allocates ROM banks and framebuffer through GEOS;
-- runs Peanut-GB;
-- accepts keyboard input;
-- provides selectable 10/30/60 requested modes;
-- builds as EC and NC variants.
+- external 32 KiB ROM loading;
+- continuous Peanut-GB execution;
+- GEOS framebuffer output;
+- Nokia keyboard input;
+- real-device installation and clean shutdown.
 
-The real-device build is `GBHW.GEO`.
-
-Current performance is not full-speed. Use `tools/gbprof` for meaningful measurements.
+It is retained as a historical baseline. Use `experiments/gbrow` for the latest benchmark build.

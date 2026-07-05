@@ -33,3 +33,8 @@ Without this preservation work, details such as GEOS memory handling, applicatio
 Thanks to the Game Boy homebrew, emulator-development, retrocomputing, PC/GEOS, and Nokia Communicator communities for keeping old platforms technically alive rather than merely displaying them behind glass.
 
 Any mistakes in the GB9110 port, documentation, benchmarks, or modified code are the responsibility of the GB9110 project, not the people thanked above.
+
+
+## AI-assisted development
+
+AI tools have assisted with source analysis, patch generation, documentation, and benchmark interpretation. All device measurements, visual checks, and build outcomes reported by GB9110 were performed and verified by the project author on the relevant SDK or real hardware.

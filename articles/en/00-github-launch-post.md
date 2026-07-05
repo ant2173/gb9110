@@ -1,41 +1,21 @@
-# Draft GitHub launch post
+# GB9110 is now on GitHub
 
-I have started publishing **GB9110**, an experimental Game Boy emulator frontend for the Nokia 9110 Communicator.
+I am publishing GB9110 as an open engineering notebook: a Game Boy emulator experiment for the Nokia 9110 Communicator, built with the original PC/GEOS SDK and Borland C++ 4.52.
 
-A real DMG ROM now:
+A real homebrew ROM already loads, executes, renders, and accepts input on actual hardware. The first measured complete frame path ran at about 5 FPS. After device-side profiling and several renderer and CPU experiments, the current best build reaches 13 FPS.
 
-- loads from the communicator filesystem;
-- executes through an adapted Peanut-GB core;
-- renders into a GEOS bitmap;
-- accepts keyboard input;
-- runs on a real Nokia 9110.
+The repository includes:
 
-It is not full-speed yet, and the repository does not pretend otherwise.
+- the early hardware frontend;
+- CPU/PPU/packing/blit profiling tools;
+- an on-device opcode and memory profiler;
+- the first successful lookup-table renderer;
+- the current ROW8 + DIV benchmark build;
+- build notes for the historical toolchain;
+- measured failures, including a tile cache with nearly 100% hits that still made the emulator slower.
 
-The interesting part is the hardware profile:
+The project is AI-assisted, but every performance claim is verified on the real Nokia. No optimization is called successful because it looks elegant in source code.
 
-```text
-CPU/core only:          21–22 FPS
-Original PPU only:           7 FPS
-PPU + packed conversion:     6 FPS
-Full frame with GEOS blit:   5 FPS
-Static GEOS 4-bpp blit:     44 FPS
-```
+This is not a finished emulator release. There is no sound, save RAM, ROM chooser, or general compatibility claim. The next practical step is frame skipping with separate guest and display rates.
 
-The project is now focused on reducing PPU work and then optimizing the LR35902 interpreter for 16-bit x86 and Borland C++ 4.52.
-
-The repository is structured as an open engineering notebook: runnable baseline, hardware profiler, current renderer experiment, build notes, measurements, and failed approaches.
-
-No ROMs or proprietary SDK files are included.
-
----
-
-## Credits
-
-This work uses the Peanut-GB core by Mahyar Koshkouei (`@deltabeard`) and the
-Flappy Bird Gameboy Homebrew test ROM by Larold's Retro Gameyard
-(`@LaroldsJubilantJunkyard`). The Nokia/GEOS work was made possible by preserved
-material from Marcus Gröber (`@mgroeber9110`) and the blueway.Softworks /
-#FreeGEOS contributors. Full credits are listed in the repository's
-`ACKNOWLEDGEMENTS.md`.
-
+The interesting part is not only that a Game Boy ROM runs on a Nokia 9110. It is that the device is old and constrained enough to make every architectural mistake visible.

@@ -1,25 +1,28 @@
 # Contributing
 
-This project is at the profiling and architecture stage. Small, measurable changes are more valuable than broad rewrites.
+GB9110 is in the measurement and architecture phase. Small changes with clean A/B evidence are more valuable than broad rewrites.
 
-## Good contributions
+## Useful contributions
 
-- a benchmark that isolates one cost;
-- a change with before/after hardware numbers;
-- Borland 4.52 code-generation analysis;
-- fixes for C89/16-bit portability;
-- reduced renderer work with visual comparison;
-- GEOS lifecycle or memory corrections;
-- documentation that makes the build reproducible.
+- Borland C++ 4.52 assembly/code-generation analysis;
+- a benchmark isolating one cost;
+- a renderer change with pixel-for-pixel comparison;
+- 16-bit C portability fixes;
+- GEOS memory, resource, or lifecycle corrections;
+- LR35902 dispatch and timing optimization;
+- reproducible Nokia 9110 hardware results;
+- documentation that makes the historical toolchain easier to use.
 
 ## Pull-request rules
 
-1. Change one subsystem at a time.
-2. Include real-hardware or SDK-emulator results.
-3. State whether the image remained correct.
-4. Do not include ROMs, SDK files, or generated binaries.
-5. Preserve third-party license notices.
-6. Do not call a change “faster” without measurements.
+1. Change one subsystem or hypothesis at a time.
+2. Include baseline and new measurements.
+3. Prefer A/B modes in the same binary.
+4. State whether image and controls remained correct.
+5. Do not include ROMs, SDK files, or generated binaries.
+6. Preserve all upstream license notices.
+7. Do not call a change faster until it is measured.
+8. Keep failed experiments documented when they teach something.
 
 ## Performance report
 
@@ -27,9 +30,12 @@ This project is at the profiling and architecture stage. Small, measurable chang
 Device:
 Toolchain:
 Build:
-Baseline mode/FPS:
-New mode/FPS:
+Baseline mode and FPS:
+New mode and FPS:
+Display/blit FPS:
 Visual differences:
-Memory changes:
-Warnings:
+Input differences:
+Memory/code-size changes:
+Compiler warnings:
+Run duration:
 ```

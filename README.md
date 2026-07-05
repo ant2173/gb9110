@@ -1,178 +1,215 @@
 # GB9110
 
-**An experimental AI-assisted Game Boy emulator frontend for the Nokia 9110 Communicator and PC/GEOS.**
+**An AI-assisted, hardware-verified Game Boy emulator experiment for the Nokia 9110 Communicator and PC/GEOS.**
 
-![GB rom running on real nokia 9110](docs/images/nokia-9110-running-gb.JPG)
+[Русская версия](README_RU.md)
 
-GB9110 is a work-in-progress port of the [Peanut-GB](https://github.com/deltabeard/Peanut-GB) emulator core to a late-1990s Nokia/GEOS development environment using Borland C++ 4.52.
+![A real Game Boy ROM running in the Nokia 9110 SDK frontend](docs/images/continuous-loop.jpg)
 
-![ROM information on Nokia Screen](docs/images/rom-running-9110.JPG)
+GB9110 ports the compact [Peanut-GB](https://github.com/deltabeard/Peanut-GB) core to the late-1990s Nokia 9110 SDK and Borland C++ 4.52 environment.
 
-The project is already past the “hello world” stage:
+The project is beyond a proof-of-concept “hello world”:
 
 - a real DMG ROM is loaded from the communicator filesystem;
-- the adapted Peanut-GB core executes on the device;
-- LCD output is rendered into a GEOS bitmap;
-- Game Boy controls are mapped to the communicator keyboard;
-- the program runs on an actual Nokia 9110;
-- hardware profiling has identified the current bottlenecks.
+- the adapted LR35902 core executes on an actual Nokia 9110;
+- Game Boy video is rendered into a GEOS 160×144 4-bpp bitmap;
+- controls are mapped to the communicator keyboard;
+- CPU, PPU, packing, and GEOS blitting have been profiled separately;
+- the complete hardware path has improved from **5 FPS to 13 FPS**.
 
-It is **not yet a usable general-purpose emulator**. The current goal is to make one small test ROM run correctly and fast enough to play, then generalize the frontend.
+It is still **not a general-purpose emulator release**. The current objective is to make one small open-source homebrew ROM correct and meaningfully playable before broadening cartridge compatibility.
 
-![First real ROM frame in the GEOS test application](docs/images/first-real-frame.jpg)
+## Current hardware result
 
-## Current status
+The best measured build is `GBROW v1.3`, combining:
+
+- packed CPU flags and 16-bit-friendly hot paths;
+- direct ROM fetch and WRAM stack paths;
+- a guarded ROM-specific division-loop superinstruction;
+- an eight-pixel ROW8 background renderer;
+- GEOS 4-bpp output.
+
+| Path | Real Nokia 9110 result |
+|---|---:|
+| Original complete renderer path | 5 guest/display FPS |
+| Lookup-table renderer (`GBTABLE v0.6`) | 9 guest/display FPS |
+| ROW8 renderer (`GBROW v1.3`) | 12 guest/display FPS |
+| DIV + ROW8 combined | **13 guest/display FPS** |
+| Best CPU-only path | 28 guest FPS |
+| Static GEOS 160×144 4-bpp blit | 44 FPS |
+
+The complete path is now **2.6× faster** than the first measured hardware build. Full Game Boy speed has not been reached; CPU execution, rendering, and display transfer are now all material costs.
+
+## Hardware profiling
+
+The profiler runs directly on the communicator and records opcode, memory-access, and interrupt counts.
+
+![Hardware profiler summary on a real Nokia 9110](docs/images/hardware-profile-summary.jpg)
+
+A 180-frame profile captured:
+
+```text
+317,034 main instructions
+ 37,440 CB-prefixed instructions
+566,046 memory reads
+ 71,442 memory writes
+  1,260 serviced interrupts
+```
+
+The ten most frequent main opcodes account for roughly half of the instruction stream. Four rotate-through-carry CB instructions account for about 95% of all CB-prefixed operations.
+
+![Top LR35902 opcodes measured on the Nokia 9110](docs/images/hardware-profile-opcodes.jpg)
+
+See [HARDWARE_PROFILE.md](docs/HARDWARE_PROFILE.md) and [BENCHMARKS.md](BENCHMARKS.md).
+
+## What worked — and what did not
+
+This repository intentionally keeps negative results.
+
+**Worked:**
+
+- four-pixel lookup-table rendering: packed path `6 → 12 FPS`;
+- CPU hot paths: core `22 → 25 FPS`;
+- broader CPU cleanup: core reached `27 FPS`;
+- division-loop superinstruction: A/B core `26 → 28 FPS`;
+- ROW8 rendering: packed `13 → 17 FPS`, full `10 → 12 FPS`;
+- DIV + ROW8: full `10 → 13 FPS`.
+
+**Did not work:**
+
+- merely removing the separate packing copy;
+- a large decoded tile-row cache, despite a 99.98–100% hit rate;
+- broad timing/housekeeping cleanup as a major standalone speedup.
+
+The failed tile cache reduced the full path from 10 to 8 FPS. Its hit path cost more than the original compact LUT decoder.
+
+## Project status
 
 | Component | Status |
 |---|---|
 | GEOS application shell | Working |
 | External 32 KiB ROM loading | Working |
-| Peanut-GB CPU core | Working |
+| Adapted Peanut-GB CPU core | Working |
 | LCD rendering | Working |
 | Keyboard input | Working |
 | Real Nokia 9110 execution | Working |
-| Stable full-speed emulation | Not yet |
+| Profiler on real hardware | Working |
+| Full Game Boy speed | Not reached |
 | Audio | Not implemented |
 | Save RAM / battery saves | Not implemented |
 | General ROM compatibility | Not tested |
 
-### Measured on real hardware
-
-The profiler separates emulation, rendering, and GEOS display transfer:
-
-| Test | Result |
-|---|---:|
-| CPU/core with LCD renderer disabled | 21–22 guest FPS |
-| Original Peanut PPU only | 7 guest FPS |
-| Original PPU plus 4-bpp packing | 6 guest FPS |
-| Full original 4-bpp path including GEOS blit | 5 guest FPS |
-| Lookup-table packed renderer, no blit | 12 guest FPS |
-| Lookup-table renderer with GEOS blit | 9 guest FPS |
-| Static 160×144 4-bpp GEOS blit | 44 FPS |
-| Static 160×144 1-bpp GEOS blit | 29 FPS |
-
-The dominant cost is currently the Game Boy line renderer, not the final GEOS screen transfer.
-
-A first “direct packed” renderer produced no measurable improvement. That negative result is documented rather than hidden: removing one copy was not enough because the inner loop still performed too much per-pixel work and scanned too many sprites.
-
-The current experiment uses lookup tables, four-pixel writes, and per-line sprite lists.
-
 ## Repository layout
 
 ```text
-src/gbhw/                 First hardware-oriented playable frontend
-tools/gbprof/             Hardware profiler used to isolate bottlenecks
-experiments/gbtable/      Current lookup-table renderer experiment
-docs/                     Architecture, history, benchmarks, roadmap
-articles/                  Draft development articles in English and Russian
-roms/                      ROM policy; no ROM images are distributed
+src/gbhw/                 Early hardware-oriented playable frontend
+tools/gbprof/             Stage profiler: CPU / PPU / pack / blit
+tools/gbcpu/              Opcode and memory-access profiler
+experiments/gbtable/      First decisive renderer optimization
+experiments/gbrow/        Current best ROW8 + DIV benchmark build
+docs/                     Architecture, profiling, history, results
+articles/                 Development articles in English and Russian
+roms/                     ROM policy; ROM images are never distributed
 ```
+
+Intermediate experiments are documented in [OPTIMIZATION_HISTORY.md](docs/OPTIMIZATION_HISTORY.md). The repository keeps selected reproducible milestones rather than every temporary build.
 
 ## Build environment
 
-The project currently targets the classic Nokia 9110 SDK / PC/GEOS toolchain:
+The tested toolchain is:
 
-- Nokia 9110 SDK (`N9110V10`)
-- Borland C++ 4.52
-- GEOS `mkmf`, `pmake`, GOC, and Glue tools
-- tested project roots:
-  - `C:\PCGEOS\N9110V10`
-  - `C:\PCGEOS\User1`
+- Nokia 9110 SDK (`N9110V10`);
+- PC/GEOS build tools;
+- Borland C++ 4.52;
+- `mkmf`, `pmake`, GOC, and Glue.
 
-See [BUILDING.md](BUILDING.md) for the exact workflow.
+Known working roots:
 
-## Quick start
-
-Copy one project into the local GEOS application tree:
-
-```bat
-xcopy /E /I src\gbhw C:\PCGEOS\User1\Appl\GBHW
-cd /d C:\PCGEOS\User1\Appl\GBHW
-mkmf
-pmake GBHW.GEO
+```text
+C:\PCGEOS\N9110V10
+C:\PCGEOS\User1
 ```
 
-The current frontend expects a user-supplied test ROM named:
+Build the current experiment:
+
+```bat
+xcopy /E /I experiments\gbrow C:\PCGEOS\User1\Appl\GBROW
+cd /d C:\PCGEOS\User1\Appl\GBROW
+BUILD_GBROW.BAT
+```
+
+The current build expects a user-supplied test ROM named:
 
 ```text
 FLAPPY.GB
 ```
 
-The ROM is **not included** in this repository.
-
-For the real communicator, place the normal build and the ROM in:
+The ROM is **not included**. On a real communicator, place `GBROW.GEO` and the ROM in:
 
 ```text
 World\ExtrApps
 ```
 
-Use `GBHW.GEO`, not the error-checking `GBHWEC.GEO`, on the real device.
+Use the normal `.GEO` build on hardware, not the EC build. See [BUILDING.md](BUILDING.md).
 
-## Why this project exists
+## Controls
 
-The Nokia 9110 is an unusually interesting target:
+```text
+Arrow keys   D-pad
+Space / Z    A
+X            B
+Enter        Start
+Tab          Select
+```
+
+## Development method
+
+The project is AI-assisted, but every meaningful claim is hardware-tested.
+
+AI has been used to inspect source, propose patches, generate diagnostic builds, maintain documentation, and compare profiling data. The human operator installs the historical toolchain, resolves build problems, runs each build on a real Nokia 9110, verifies the image and controls, and records the measurements.
+
+The governing rule is simple: **no optimization is called successful until the real device says so.**
+
+## Why the Nokia 9110?
+
+It is an unusually revealing target:
 
 - a real multitasking graphical operating system;
-- a 16-bit segmented C environment;
-- strict memory and code-resource constraints;
-- a wide monochrome display and a full keyboard;
-- tooling old enough to punish assumptions that modern platforms make invisible.
+- a segmented 16-bit x86 C environment;
+- strict fixed-data and code-resource constraints;
+- a wide monochrome display and full keyboard;
+- old tools that expose costs hidden by modern compilers and hardware.
 
-Porting an emulator here is not only nostalgia. It is a practical exercise in profiling, memory layout, message-driven scheduling, binary compatibility, and optimization under hard constraints.
-
-## What has already been learned
-
-1. **Raw callback pointers were unsafe in this build environment.**  
-   Peanut-GB was adapted to use compile-time direct hooks for ROM access, LCD output, and error reporting.
-
-2. **Application identity matters in GEOS.**  
-   Reusing a permanent name/token caused stale-state behavior that looked like a code hang. Fresh identities made diagnostic builds reproducible.
-
-3. **Large globals matter even when `dgroup` looks small.**  
-   The framebuffer was moved from uninitialized fixed data into a separately allocated and locked GEOS memory block.
-
-4. **A requested timer rate is not actual emulation speed.**  
-   On the PC emulator the frontend reached about 59 guest FPS. On real hardware the same loop exposed the true CPU and PPU cost.
-
-5. **The obvious optimization was not the important one.**  
-   Removing the second framebuffer packing pass did not improve FPS. The renderer’s algorithmic cost dominated.
+This is nostalgia with instrumentation: emulator architecture, GEOS memory management, event-driven scheduling, old-C portability, and performance engineering under hard constraints.
 
 ## Roadmap
 
-- validate the lookup-table renderer visually and measure it on hardware;
-- reduce PPU cost enough to make the test ROM meaningfully playable;
-- profile and optimize the LR35902 instruction loop;
-- add adaptive frame skipping without breaking input timing;
-- separate ROM loading from the hard-coded test filename;
-- implement cartridge RAM and save files;
-- add a minimal launcher;
-- investigate audio only after stable video performance.
+The next practical milestone is decoupling guest execution from display updates:
 
-See [ROADMAP.md](ROADMAP.md) for the detailed plan.
+- fixed and adaptive frame skipping;
+- independent guest FPS and display FPS;
+- input timing verification under skipped frames;
+- a lean current build with historical benchmark modes removed;
+- then another profiler-guided CPU or assembly experiment.
 
+General cartridge support, save RAM, a ROM chooser, and audio come later. See [ROADMAP.md](ROADMAP.md).
 
-## Acknowledgements
+## Acknowledgements and legal notes
 
-GB9110 builds on the work of Mahyar Koshkouei and Peanut-GB, Larold's Retro Gameyard and the Flappy Bird Game Boy homebrew, Marcus Gröber's Nokia 9000/9110 preservation work, and the blueway.Softworks / #FreeGEOS community.
+GB9110 builds on work by Mahyar Koshkouei / Peanut-GB, Larold's Retro Gameyard and the Flappy Bird Game Boy homebrew, Marcus Gröber's Nokia 9000/9110 preservation work, and the blueway.Softworks / #FreeGEOS community.
 
-See [ACKNOWLEDGEMENTS.md](ACKNOWLEDGEMENTS.md) for full credits and links.
+See [ACKNOWLEDGEMENTS.md](ACKNOWLEDGEMENTS.md), [NOTICE.md](NOTICE.md), and [roms/README.md](roms/README.md).
 
-## Legal and ROM policy
-
-GB9110 does not include commercial ROMs or the test ROM used during development. Users must supply ROM images they are legally entitled to use.
-
-Peanut-GB is MIT-licensed. Its original copyright and license notice are retained in the modified header files. See [NOTICE.md](NOTICE.md).
-
-Nintendo, Game Boy, Nokia, and GEOS are trademarks of their respective owners. This project is unaffiliated with them.
+Nintendo, Game Boy, Nokia, GEOS, and Flappy Bird are trademarks or properties of their respective owners. GB9110 is an independent, non-commercial engineering project and is not endorsed by them.
 
 ## Project state
 
-This repository should be read as an **open engineering notebook with runnable code**, not as a finished emulator release.
+Treat this repository as an **open engineering notebook with runnable source**, not a finished emulator release.
 
-That is intentional. The most useful contribution right now is expertise in:
+The most useful contributions today are expertise in:
 
-- 16-bit x86 optimization;
-- Borland C++ 4.x code generation;
-- PC/GEOS memory and graphics internals;
-- Game Boy PPU optimization;
-- old Nokia communicator development.
+- 16-bit x86 and Borland C++ 4.x code generation;
+- PC/GEOS memory, graphics, and code resources;
+- LR35902 dispatch and timing optimization;
+- Game Boy PPU rendering;
+- development for Nokia Communicator hardware.

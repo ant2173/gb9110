@@ -1,3 +1,5 @@
+> **Historical snapshot.** This article documents the first real-frame milestone. Current hardware results are summarized in the root README and BENCHMARKS.md.
+
 # A Game Boy emulator on the Nokia 9110: the first real frame
 
 The Nokia 9110 Communicator is not an obvious emulation target.

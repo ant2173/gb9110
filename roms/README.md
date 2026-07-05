@@ -1,13 +1,13 @@
-# ROM files
+# ROM policy
 
-No ROM images are included or accepted in this repository.
+No ROM image is distributed with GB9110.
 
-The current development frontend expects a user-supplied test ROM named:
+The current benchmark sources expect a user-supplied 32 KiB test image named:
 
 ```text
 FLAPPY.GB
 ```
 
-This filename is temporary and will be replaced by a ROM-selection interface.
+The main development workload has been the open-source Flappy Bird Game Boy homebrew by Larold's Retro Gameyard. Obtain it from its original project or use another ROM you are legally entitled to use.
 
-Only use ROM images that you are legally entitled to possess and run.
+Do not submit ROM images in issues, pull requests, release assets, or source archives.

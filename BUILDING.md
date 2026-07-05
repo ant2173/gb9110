@@ -1,13 +1,13 @@
 # Building GB9110
 
-## Required toolchain
+## Required environment
 
-The current source tree is built with:
+The tested build environment is:
 
-- Nokia 9110 SDK / `N9110V10`
-- PC/GEOS build tools
-- Borland C++ 4.52
-- a configured command prompt containing the GEOS paths and environment
+- Nokia 9110 SDK / `N9110V10`;
+- PC/GEOS build tools;
+- Borland C++ 4.52;
+- a configured GEOS command prompt.
 
 Known working roots:
 
@@ -16,89 +16,90 @@ C:\PCGEOS\N9110V10
 C:\PCGEOS\User1
 ```
 
-## Build the hardware frontend
+## Current experiment: GBROW v1.3
 
-Copy the project:
+Copy the current experiment:
 
 ```bat
-xcopy /E /I src\gbhw C:\PCGEOS\User1\Appl\GBHW
-cd /d C:\PCGEOS\User1\Appl\GBHW
+xcopy /E /I experiments\gbrow C:\PCGEOS\User1\Appl\GBROW
+cd /d C:\PCGEOS\User1\Appl\GBROW
 ```
 
-Generate makefiles:
+Build both variants:
 
 ```bat
-mkmf
+BUILD_GBROW.BAT
 ```
 
-Build the error-checking version:
+Expected output:
 
-```bat
-pmake GBHWEC.GEO
-```
-
-Build the normal version:
-
-```bat
-pmake GBHW.GEO
+```text
+GBROWEC.GEO
+GBROW.GEO
 ```
 
 Use:
 
-- `GBHWEC.GEO` for SDK/emulator diagnostics;
-- `GBHW.GEO` on the real communicator.
+- `GBROWEC.GEO` for EC diagnostics in the SDK environment;
+- `GBROW.GEO` on the real Nokia 9110.
 
-## Build the profiler
+## CPU profiler
 
 ```bat
-xcopy /E /I tools\gbprof C:\PCGEOS\User1\Appl\GBProf
-cd /d C:\PCGEOS\User1\Appl\GBProf
-BUILD.BAT
+xcopy /E /I tools\gbcpu C:\PCGEOS\User1\Appl\GBCPU
+cd /d C:\PCGEOS\User1\Appl\GBCPU
+BUILD_GBCPU.BAT
 ```
 
-## Build the current renderer experiment
+The profiler records 256 main opcodes, 256 CB opcodes, memory-region reads/writes, interrupts, and elapsed GEOS ticks.
+
+## Earlier hardware frontend
 
 ```bat
-xcopy /E /I experiments\gbtable C:\PCGEOS\User1\Appl\GBTable
-cd /d C:\PCGEOS\User1\Appl\GBTable
-BUILD_GBTABLE.BAT
+xcopy /E /I src\gbhw C:\PCGEOS\User1\Appl\GBHW
+cd /d C:\PCGEOS\User1\Appl\GBHW
+BUILD.BAT
 ```
 
 ## ROM placement
 
-No ROM is included.
+No ROM is included in the repository.
 
-The current frontend expects a user-provided 32 KiB ROM named:
+The current sources expect a user-supplied 32 KiB ROM named:
 
 ```text
 FLAPPY.GB
 ```
 
-For the SDK target, place it in:
+SDK target:
 
 ```text
 C:\PCGEOS\Target\n9110v10.ec\server\World\ExtrApps
 ```
 
-or the corresponding normal target tree.
-
-For the real communicator, place the ROM and `.GEO` file in:
+Real communicator:
 
 ```text
 World\ExtrApps
 ```
 
-## Common warnings
+Place the normal `.GEO` and ROM together on hardware.
 
-The old compiler emits warnings about bit-field types in the adapted Peanut-GB header. These warnings have been observed in successful builds, but they should not be ignored forever: the ABI assumptions need a permanent documented solution.
+## Expected warnings
 
-A warning that a text resource is large is also expected. The code currently remains monolithic; splitting the adapted core into movable code resources is a later task.
+Borland may report:
 
-## Do not publish
+```text
+Bit fields must be signed or unsigned int
+```
 
-Do not commit:
+The original CPU flag-register bit fields were removed in later builds, but unrelated Peanut-GB structures still contain bit fields.
 
-- ROM files;
-- SDK binaries;
-- Nokia or PC/GEOS proprietary files;
-- generated `.GEO`, `.OBJ`, `.EOBJ`, `.EC`, dependency, or map files.
+The linker may also warn that the main text resource is large. Benchmark binaries intentionally contain multiple old and new renderers for A/B testing. A release-oriented build should remove historical modes and split code into movable resources.
+
+## Never commit
+
+- ROM images;
+- Nokia SDK or PC/GEOS proprietary files;
+- generated `.GEO`, `.OBJ`, `.EOBJ`, `.EC`, map, dependency, or temporary files;
+- local toolchain paths or licensed compiler components.

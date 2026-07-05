@@ -1,33 +1,32 @@
-# GEOS/Borland generated files
-*.GEO
-*.geo
-*.OBJ
-*.obj
-*.EOBJ
-*.eobj
-*.EC
-*.ec
-*.MAP
-*.map
-*.SYM
-*.sym
-*.LST
-*.lst
-*.tmp
-DEPENDENCIES.MK
-dependencies.mk
-Makefile
-
-# ROMs and save files
+# ROMs
 *.gb
 *.gbc
-*.sav
+*.rom
+roms/*.bin
 
-# Archives and editor files
-*.zip
-*.7z
-*.rar
+# GEOS / Borland build outputs
+*.geo
+*.obj
+*.eobj
+*.ec
+*.nc
+*.map
+*.sym
+*.lst
+*.tmp
 *.bak
-*.swp
-Thumbs.db
+dependencies.mk
+Makefile
+*.mk
+
+# Local SDK/project noise
+DEPENDENCIES/
+*.dsk
+*.vmdk
+*.log
+
+# OS/editor
 .DS_Store
+Thumbs.db
+.vscode/
+.idea/

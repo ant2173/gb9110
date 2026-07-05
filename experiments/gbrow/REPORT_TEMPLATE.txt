@@ -1,0 +1,32 @@
+GBROW v1.3 HARDWARE RESULT
+============================
+
+Build:
+  EC built:
+  NC built:
+  New compiler errors:
+  Relevant warnings:
+
+A/B renderer:
+  3 TABLE PACK: GUEST FPS =
+  8 ROW8 PACK:  GUEST FPS =
+
+  4 TABLE FULL: GUEST FPS =    BLIT FPS =
+  9 ROW8 FULL:  GUEST FPS =    BLIT FPS =
+
+Combined:
+  7 DIV FULL:       GUEST FPS =    BLIT FPS =    DIV HITS =
+  0 DIV+ROW8 FULL:  GUEST FPS =    BLIT FPS =    DIV HITS =
+
+Correctness:
+  Background:
+  Scrolling:
+  Bird and pipes:
+  Window/menu:
+  Sprite priority:
+  Screen edges:
+  Stable continuous play:
+  Reset:
+  Quit:
+
+Notes:

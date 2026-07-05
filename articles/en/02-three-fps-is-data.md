@@ -1,3 +1,5 @@
+> **Historical snapshot.** This article ends at the GBTABLE v0.6 stage. Later CPU and ROW8 work raised the complete path to 13 FPS.
+
 # Three FPS is not failure: profiling a Game Boy emulator on the Nokia 9110
 
 The first hardware run worked.

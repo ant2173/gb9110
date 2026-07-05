@@ -1,18 +1,15 @@
-# GBTABLE
+# GBTABLE v0.6
 
-Current experimental renderer.
+Historical milestone: the first renderer rewrite with a decisive real-hardware gain.
 
-The design attempts to reduce algorithmic work through:
+```text
+Original packed renderer   6 FPS
+GBTABLE packed renderer   12 FPS
+Original full path         5 FPS
+GBTABLE full path          9 FPS
+Static 4-bpp blit         44 FPS
+```
 
-- four-pixel lookup-table decoding;
-- 16-bit packed framebuffer writes;
-- precomputed first-ten-sprites-per-line lists;
-- per-line sprite filtering.
+The build uses four-pixel lookup-table groups and prepared sprite lists.
 
-Measured on the real device:
-
-- core only: 22 guest FPS;
-- original packed renderer: 6 guest FPS;
-- table packed renderer: 12 guest FPS;
-- table renderer with GEOS blit: 9 guest FPS;
-- static 4-bpp blit: 44 FPS.
+The ROM is not included.

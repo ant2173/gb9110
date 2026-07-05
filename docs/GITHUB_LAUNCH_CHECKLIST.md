@@ -1,29 +1,35 @@
-# GitHub launch checklist
+# GitHub publication checklist
 
-## Before making the repository public
+## Before pushing
 
-- [ ] Replace the placeholder in `LICENSE`
-- [ ] Choose repository name (`gb9110` is the current suggestion)
-- [ ] Add one clear photo of the app running on the real communicator
-- [ ] Verify the clean build instructions from an empty project directory
-- [ ] Confirm no ROM, SDK binary, or generated `.GEO` file is tracked
-- [ ] Check that every adapted Peanut-GB header retains the MIT notice
-- [ ] Review `ACKNOWLEDGEMENTS.md` and `ACKNOWLEDGEMENTS_RU.md`
-- [ ] Add the latest lookup-renderer hardware result
-- [ ] Decide whether to expose experimental source immediately or on a branch
-- [ ] Add a short repository description:
-  `Game Boy emulation experiment for the Nokia 9110 Communicator / PC/GEOS`
-- [ ] Add topics:
-  `nokia-9110`, `pc-geos`, `game-boy`, `emulator`, `retrocomputing`, `borland-cpp`
+- [ ] search the tree for `.GB`, `.GBC`, `.ROM`, `.GEO`, `.OBJ`, `.EOBJ`, and SDK files
+- [ ] confirm adapted Peanut-GB headers retain upstream license notices
+- [ ] confirm all screenshots are owned by the project author
+- [ ] verify README image paths and language links
+- [ ] verify the current build instructions from a clean directory
+- [ ] note that the DIV path is ROM-signature-specific
+- [ ] do not describe 13 FPS as full-speed or generally compatible
+- [ ] keep failed experiments in the written history
 
-## Suggested publication order
+## Suggested repository description
 
-1. Create the repository quietly.
-2. Push the curated baseline, profiler, documentation, and articles.
-3. Verify links and build instructions.
-4. Publish the first article with a real-device photo.
-5. Share it with retrocomputing, GEOS, and emulator-development communities.
+> Hardware-verified Game Boy emulation experiments for Nokia 9110 / PC/GEOS, using Peanut-GB and Borland C++ 4.52.
 
-Do not lead with “full-speed emulator.” Lead with the true and stronger claim:
+## Suggested topics
 
-> A real Game Boy ROM now executes, renders, and accepts input on a real Nokia 9110, and the bottlenecks have been measured.
+```text
+nokia-9110
+nokia-communicator
+pc-geos
+game-boy
+emulator
+retrocomputing
+borland-cpp
+16-bit
+performance
+ai-assisted-development
+```
+
+## Suggested update headline
+
+> From 5 to 13 FPS on a real Nokia 9110: profiler-guided CPU and ROW8 renderer optimization.

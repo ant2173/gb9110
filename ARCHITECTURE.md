@@ -1,41 +1,46 @@
-# Architecture notes
+# Architecture
 
-## Frontend
+## 1. GEOS frontend
 
-The GEOS frontend owns:
+The frontend owns:
 
-- application lifecycle;
+- application lifecycle and object messages;
 - ROM file loading;
-- memory block allocation and locking;
+- GEOS memory allocation and locking;
 - keyboard events;
-- work scheduling;
-- framebuffer conversion;
-- drawing and status UI.
+- one-at-a-time queued work scheduling;
+- framebuffer storage and GEOS drawing;
+- benchmark UI and counters.
 
-## Core integration
+The maximum-throughput loop executes one guest unit, updates counters when needed, and queues exactly one next work message. It does not intentionally build a timer backlog.
 
-Peanut-GB originally expects callback functions stored in the emulator state.
+## 2. Peanut-GB integration
 
-In the tested Borland/GEOS environment, raw stored callback pointers caused a runtime failure. The port therefore uses compile-time direct hook macros for:
+Peanut-GB is adapted for:
 
-- ROM reads;
-- cartridge RAM reads/writes;
-- errors;
-- LCD line output.
+- Borland C++ 4.52;
+- C89-era syntax;
+- 16-bit segmented memory;
+- PC/GEOS allocation and application rules.
 
-This is less elegant than the upstream interface, but it is currently stable and measurable.
+Stored callback pointers were unreliable in the tested environment. The port therefore uses compile-time direct hook macros for ROM access, LCD output, errors, and selected profiling paths.
 
-## ROM memory
+## 3. ROM memory
 
-The 32 KiB test ROM is loaded into two separately allocated and locked 16 KiB GEOS memory blocks.
+The current 32 KiB ROM is loaded into two separately allocated and locked 16 KiB blocks:
 
-This avoids embedding the whole ROM in fixed data and avoids overflowing the 64 KiB near-data model.
+```text
+0000–3FFF  fixed bank
+4000–7FFF  switchable bank
+```
 
-## Framebuffer
+This avoids placing the ROM in fixed near data and respects the 64 KiB data-model constraints.
 
-The initial framebuffer lived in uninitialized global data. The hardware frontend moves it into a separate allocated and locked block.
+The current benchmark is deliberately ROM-specific. General MBC and variable-size ROM handling are future work.
 
-The current display format is:
+## 4. Emulator state and framebuffer
+
+The display buffer is allocated outside fixed global data:
 
 ```text
 160 × 144 pixels
@@ -44,29 +49,48 @@ The current display format is:
 11,520 bytes per frame
 ```
 
-A 1-bpp framebuffer was tested but produced a lower static blit rate than 4-bpp on the current GEOS path.
+A static 4-bpp GEOS transfer reaches about 44 FPS on the device. A tested 1-bpp path reached only 29 FPS, so 4-bpp remains the preferred output format despite the monochrome screen.
 
-## Scheduling
+## 5. CPU hot paths
 
-A continual timer works well in the fast SDK emulator but can accumulate work or obscure the real throughput limit on hardware.
+Measured optimizations include:
 
-Profiler builds use:
+- direct fixed-bank instruction fetch;
+- direct WRAM stack operations for common `PUSH`/`POP`;
+- packed `F` register masks instead of per-flag bit fields;
+- hot CB operations handled before the generic decoder;
+- simplified interrupt and timer housekeeping;
+- selected removal of unnecessary 32-bit arithmetic.
 
-1. execute one unit of work;
-2. update measurements when required;
-3. queue exactly one next work message.
+A guarded superinstruction recognizes an exact division-loop ROM signature and executes one guest iteration in native C while preserving registers, stack effects, cycles, and safe fallback behavior.
 
-This measures the maximum sustainable rate without intentionally building a timer backlog.
+## 6. Renderer evolution
 
-## Current performance model
+### Original path
 
-Approximate real-hardware results:
+The upstream line renderer produced pixels, then the frontend packed them for GEOS. Full performance was about 5 FPS.
 
-```text
-CPU/core only                  21–22 FPS
-CPU + original PPU                 7 FPS
-CPU + PPU + packed conversion      6 FPS
-Complete frame with GEOS output    5 FPS
-```
+### GBTABLE
 
-The next optimization target is the PPU, followed by LR35902 dispatch and memory access.
+A lookup-table renderer emits four packed pixels at once and prepares sprite lists per scanline. This reached 12 FPS without blit and 9 FPS with blit.
+
+### Failed tile cache
+
+A separate decoded tile-row cache achieved almost perfect hit rates but was slower. The 16-bit compiler and segmented-memory access made the lookup path more expensive than direct compact decoding.
+
+### ROW8
+
+The current renderer processes 20 groups of eight pixels per scanline rather than 40 groups of four. `SCX & 7` and tile-addressing mode are selected once per line. Previous tile-row data is reused, and four output bytes are produced per iteration.
+
+ROW8 reaches 17 FPS without blit and 12 FPS with blit. Combined with the CPU superinstruction, the full path reaches 13 FPS.
+
+## 7. Current bottleneck model
+
+At the present stage there is no single dominant subsystem:
+
+- optimized CPU execution is capped near 28 guest FPS;
+- ROW8 rendering lowers the no-blit path to 17 FPS;
+- the complete path is 13 FPS;
+- a static blit is 44 FPS.
+
+The next architectural step is to run every guest frame while rendering and blitting only selected frames.

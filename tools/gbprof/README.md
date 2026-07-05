@@ -1,11 +1,13 @@
-# GBPROF
+# GBPROF v0.3
 
-Hardware profiler used to separate:
+Stage profiler for real Nokia 9110 hardware.
 
-- core execution;
-- renderer and packing;
-- full GEOS output;
-- static 4-bpp blit;
-- static 1-bpp blit.
+It isolates:
 
-Do not interpret the SDK emulator's FPS as real Nokia performance.
+- CPU/core;
+- PPU rendering;
+- 4-bpp packing;
+- complete frame output;
+- static 4-bpp and 1-bpp GEOS blits.
+
+This profiler established the first hardware baseline and showed that the early 3 FPS behavior was workload-bound rather than a timer-rate bug.

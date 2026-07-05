@@ -1,68 +1,47 @@
-# Development history
+# Project history
 
-## 1. GEOS foundation
+## 1. GEOS shell and framebuffer
 
-The first milestones intentionally avoided emulation:
-
-- static drawing;
-- timer-driven animation;
-- full 160×144 4-bpp framebuffer;
-- synthetic CPU workload.
-
-This established that GEOS drawing and scheduling worked before introducing Peanut-GB.
+The project began by proving that a custom application could build, install, draw, and update under the Nokia 9110 SDK.
 
 ## 2. Peanut-GB adaptation
 
-The upstream header targets C99-style environments. The port required work for:
-
-- Borland C++ 4.52;
-- C89-era syntax and library assumptions;
-- 16-bit segmented memory;
-- GEOS-specific file and heap APIs.
-
-Raw callback pointers caused a runtime failure. Compile-time direct hooks became the stable integration method.
+The core was modified for Borland C++ 4.52, C89-era constraints, direct hooks, and segmented GEOS memory.
 
 ## 3. First real ROM frame
 
-The ROM was first embedded, which pushed too much data into the near-data model. The successful design loads two 16 KiB banks from an external file into GEOS memory blocks.
+A 32 KiB ROM loaded from the filesystem and completed a real frame:
 
-A fresh GEOS application identity was also essential. Reusing an old permanent name/token could restore stale state and imitate a startup hang.
+```text
+CPU steps: 6005
+LCD lines:  144
+Core errors: 0
+```
 
 ## 4. Continuous execution and input
 
-A conservative 10 FPS build worked. The same design reached 30 FPS and then about 59 guest FPS in the SDK emulator. Keyboard input was added without changing the proven scheduling loop.
+The SDK frontend ran continuously and accepted keyboard input. The real phone exposed the true limit: about 3 FPS in the early unoptimized application, with visible flicker.
 
-## 5. First real-hardware run
+## 5. Hardware profiler
 
-The program launched on an actual Nokia 9110, but:
+Full-window clearing was removed, work became self-queued, and CPU/PPU/packing/blit stages were measured independently. The initial complete path was about 5 FPS.
 
-- the whole screen visibly flickered;
-- all requested speed modes converged near 3 FPS.
+## 6. Renderer redesign
 
-The flicker came from clearing and redrawing the whole status window. The identical speed across timer modes showed that work duration, not requested cadence, was the limit.
+Direct packing failed. Four-pixel LUT rendering succeeded, raising the complete path to 9 FPS.
 
-## 6. Profiler-driven optimization
+## 7. CPU profiling
 
-A self-queued profiler separated:
+A real-device opcode and memory profiler identified hot branches, stack traffic, fixed-bank ROM fetches, and a CB-heavy division routine.
 
-- CPU;
-- PPU;
-- framebuffer packing;
-- GEOS blit.
+## 8. CPU optimization
 
-Results showed a 21–22 FPS CPU-only ceiling, a drop to 7 FPS with the PPU, and about 5 FPS for the complete path.
+Direct ROM and stack paths, packed flags, timing cleanup, and a guarded division superinstruction raised the CPU-only path to 28 FPS.
 
-## 7. Negative result
+## 9. Cache failure and ROW8 success
 
-A direct packed renderer eliminated the temporary scanline and final copy but stayed at 6 FPS. The algorithm still performed too much work and scanned all sprites per line.
+A decoded tile cache slowed the program despite nearly perfect hit rates. A simpler ROW8 design halved the renderer loop count and raised the complete path to 12 FPS.
 
-## 8. Current experiment
+## 10. Current result
 
-The current lookup-table renderer attempts to:
-
-- decode four background pixels per iteration;
-- use one 16-bit store for four packed pixels;
-- preselect the first ten sprites touching each scanline;
-- visit only relevant sprites during line rendering.
-
-Real-hardware measurement showed 12 guest FPS without the GEOS blit and 9 FPS for the complete path, compared with 6 and 5 FPS respectively for the original renderer.
+Combining DIV and ROW8 reaches 13 guest/display FPS on the real Nokia 9110: 2.6× the first complete measured path.

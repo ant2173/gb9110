@@ -1,12 +1,14 @@
 ---
-name: Hardware performance result
-about: Report a reproducible benchmark from a communicator or SDK target
-title: "[benchmark] "
+name: Performance result
+about: Submit a reproducible Nokia 9110 benchmark
+title: "[PERF] "
 labels: performance
 assignees: ""
 ---
 
-**Device / target**
+**Device**
+
+**Toolchain / SDK**
 
 **Build and commit**
 
@@ -14,10 +16,14 @@ assignees: ""
 
 **Guest FPS**
 
-**Blit FPS**
+**Display / blit FPS**
+
+**Run duration**
 
 **Visual correctness**
 
-**Toolchain**
+**Input correctness**
 
-**Additional notes**
+**Compiler/linker warnings**
+
+**Notes**
